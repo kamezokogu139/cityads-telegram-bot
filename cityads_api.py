@@ -81,11 +81,11 @@ async def get_my_offers(telegram_id: int, limit: int = 50) -> list[dict]:
 
 
 async def get_offer_with_links(telegram_id: int, offer_id: str) -> dict | None:
-    """Single offer with its tracking links via /v2/offers/list?id=..."""
+    """Single offer with its tracking links via /v2/offers/list?ids=..."""
     data = await _v2_request(
         telegram_id,
         "offers/list",
-        params={"id": offer_id},
+        params={"ids": offer_id},
     )
     offers = _extract_offers(data, key="offers")
     return offers[0] if offers else None
