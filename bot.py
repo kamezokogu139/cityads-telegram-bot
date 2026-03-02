@@ -294,14 +294,20 @@ async def _send_offer_links(msg: Message, offer: dict, offer_id: str):
 
     header = f"🔗 <b>{offer_name}</b> (ID: {offer_id})\n\n" if offer_name else ""
     text = header
+    shown = 0
     for i, link in enumerate(links, 1):
         name = link.get("name", f"Link {i}")
         deep_link = link.get("deep_link", "—")
         is_default = link.get("is_default", False)
         star = "⭐ " if is_default else ""
-        text += f"{star}<b>{name}</b> — <code>{deep_link}</code>\n\n"
+        line = f"{star}<b>{name}</b> — <code>{deep_link}</code>\n\n"
+        if len(text) + len(line) > 3900:
+            text += f"… and {len(links) - shown} more links"
+            break
+        text += line
+        shown += 1
 
-    await msg.edit_text(text[:4000], parse_mode="HTML", reply_markup=_search_back_kb())
+    await msg.edit_text(text, parse_mode="HTML", reply_markup=_search_back_kb())
 
 
 # ── Create deeplink (enter offer ID → get base link → enter URL) ────────────
