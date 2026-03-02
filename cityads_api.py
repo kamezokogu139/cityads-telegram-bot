@@ -1,17 +1,16 @@
+import json
 import time
 import logging
-import xml.etree.ElementTree as ET
 from urllib.parse import urlencode, quote
+
 import aiohttp
 from config import CITYADS_AUTH_URL, CITYADS_API_BASE
 import db
 
 logger = logging.getLogger(__name__)
 
-CLICK_DOMAIN = "yajgm.com"
 
-
-# ── OAuth 2.0 (for v2 API) ──────────────────────────────────────────────────
+# ── OAuth 2.0 ────────────────────────────────────────────────────────────────
 
 async def _fetch_new_token(client_id: str, client_secret: str) -> tuple[str, int]:
     payload = {
@@ -24,7 +23,8 @@ async def _fetch_new_token(client_id: str, client_secret: str) -> tuple[str, int
             if resp.status != 200:
                 text = await resp.text()
                 raise RuntimeError(f"CityAds auth error ({resp.status}): {text}")
-            data = await resp.json()
+            text = await resp.text()
+            data = json.loads(text)
             return data["access_token"], data["expires_in"]
 
 
@@ -43,14 +43,14 @@ async def get_token(telegram_id: int) -> str:
     return token
 
 
-# ── v2 API (OAuth X-Access-Token) ───────────────────────────────────────────
+# ── v2 API request ───────────────────────────────────────────────────────────
 
 async def _v2_request(
     telegram_id: int,
     endpoint: str,
     *,
     params: dict | None = None,
-) -> dict | str:
+) -> dict | list:
     token = await get_token(telegram_id)
     url = f"{CITYADS_API_BASE}/v2/{endpoint.lstrip('/')}"
     headers = {"X-Access-Token": token}
@@ -59,98 +59,48 @@ async def _v2_request(
         async with session.get(url, headers=headers, params=params) as resp:
             body = await resp.text()
             if resp.status >= 400:
-                raise RuntimeError(f"v2 API error ({resp.status}): {body[:200]}")
-            ct = resp.headers.get("Content-Type", "")
-            if "json" in ct:
-                import json
-                return json.loads(body)
-            return body
+                raise RuntimeError(f"API error ({resp.status}): {body[:200]}")
+            return json.loads(body)
 
 
-# ── v1 XML API (remote_auth) ────────────────────────────────────────────────
-
-async def _v1_request(
-    telegram_id: int,
-    endpoint: str,
-    *,
-    params: dict | None = None,
-) -> str:
-    remote_auth = await db.get_remote_auth(telegram_id)
-    if not remote_auth:
-        raise RuntimeError("remote_auth not set. Use /connect")
-
-    url = f"{CITYADS_API_BASE}/xml/{endpoint.lstrip('/')}"
-    p = dict(params) if params else {}
-    p["remote_auth"] = remote_auth
-
-    async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False)) as session:
-        async with session.get(url, params=p) as resp:
-            body = await resp.text()
-            if resp.status == 403:
-                raise PermissionError("Access denied. Check your remote_auth key (/connect)")
-            if resp.status >= 400:
-                raise RuntimeError(f"v1 API error ({resp.status}): {body[:200]}")
-            return body
-
-
-# ── Offers (v2) ──────────────────────────────────────────────────────────────
+# ── Offers ───────────────────────────────────────────────────────────────────
 
 async def get_my_offers(telegram_id: int, limit: int = 50) -> list[dict]:
+    """Subscribed offers via /v2/offers/list (includes links)."""
     data = await _v2_request(
-        telegram_id, "offers",
-        params={"limit": limit, "user_has_offer": "true", "sort": "name", "sort_type": "asc"},
+        telegram_id,
+        "offers/list",
+        params={
+            "limit": limit,
+            "user_has_offer": "true",
+            "sort": "name",
+            "sort_type": "asc",
+        },
     )
-    return _extract_offers(data)
+    return _extract_offers(data, key="offers")
 
 
-async def get_offer(telegram_id: int, offer_id: str) -> dict:
-    data = await _v2_request(telegram_id, f"offers/{offer_id}")
-    if isinstance(data, dict):
-        return data.get("offer", data)
-    return {}
+async def get_offer_with_links(telegram_id: int, offer_id: str) -> dict | None:
+    """Single offer with its tracking links via /v2/offers/list?id=..."""
+    data = await _v2_request(
+        telegram_id,
+        "offers/list",
+        params={"id": offer_id},
+    )
+    offers = _extract_offers(data, key="offers")
+    return offers[0] if offers else None
 
 
-def _extract_offers(data) -> list[dict]:
+def _extract_offers(data, *, key: str = "offers") -> list[dict]:
     if isinstance(data, list):
         return data
     if isinstance(data, dict):
-        val = data.get("offer", data.get("offers", []))
+        val = data.get(key, [])
         if isinstance(val, list):
             return val
         if isinstance(val, dict):
             return [val]
     return []
-
-
-# ── Offer links (v1 XML) ────────────────────────────────────────────────────
-
-async def get_offer_links(telegram_id: int, offer_id: int | str) -> list[dict]:
-    xml_body = await _v1_request(telegram_id, f"offer-links/{offer_id}")
-    return _parse_offer_links_xml(xml_body)
-
-
-def _parse_offer_links_xml(xml_text: str) -> list[dict]:
-    try:
-        root = ET.fromstring(xml_text)
-    except ET.ParseError:
-        return []
-
-    items = root.findall(".//items/item") or root.findall(".//data/items/item")
-    result = []
-    for item in items:
-        entry = {}
-        title_el = item.find("title")
-        if title_el is not None and title_el.text:
-            entry["title"] = title_el.text
-        default_el = item.find("is_default")
-        if default_el is not None and default_el.text:
-            entry["is_default"] = default_el.text.lower() in ("true", "1")
-        link_el = item.find("deep_link")
-        if link_el is not None and link_el.text:
-            entry["deep_link"] = link_el.text
-        if entry:
-            result.append(entry)
-    return result
 
 
 # ── Link builders ────────────────────────────────────────────────────────────
