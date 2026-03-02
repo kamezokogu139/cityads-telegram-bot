@@ -31,7 +31,7 @@ class ConnectFlow(StatesGroup):
 
 
 class GetLinksFlow(StatesGroup):
-    waiting_offer_id = State()
+    waiting_search = State()
 
 
 class DeeplinkFlow(StatesGroup):
@@ -217,36 +217,80 @@ async def cb_my_offers(callback: CallbackQuery):
         await callback.message.edit_text(f"❌ Error: {e}", reply_markup=back_kb())
 
 
-# ── Get tracking links (enter offer ID → show links) ────────────────────────
+# ── Get tracking links: search by name → select offer → show links ──────────
 
 @router.callback_query(F.data == "get_links")
 async def cb_get_links(callback: CallbackQuery, state: FSMContext):
     if not await require_auth(callback):
         return
     await callback.answer()
-    await state.set_state(GetLinksFlow.waiting_offer_id)
+    await state.set_state(GetLinksFlow.waiting_search)
     await callback.message.edit_text(
-        "🔗 <b>Get tracking links</b>\n\n"
-        "Send the <b>Offer ID</b>.",
+        "🔍 <b>Search offer</b>\n\n"
+        "Type the offer name (or part of it).",
         parse_mode="HTML",
     )
 
 
-@router.message(GetLinksFlow.waiting_offer_id)
-async def process_get_links(message: Message, state: FSMContext):
-    offer_id = message.text.strip()
-    if not offer_id.isdigit():
-        await message.answer("⚠️ Offer ID should be a number. Try again.")
+@router.message(GetLinksFlow.waiting_search)
+async def process_search_offers(message: Message, state: FSMContext):
+    query = message.text.strip()
+    if len(query) < 2:
+        await message.answer("⚠️ Enter at least 2 characters.")
         return
 
     await state.clear()
     uid = message.from_user.id
-    status_msg = await message.answer("⏳ Fetching links...")
+    status_msg = await message.answer("⏳ Searching...")
+
+    try:
+        offers = await api.search_my_offers(uid, query)
+        if not offers:
+            await status_msg.edit_text(
+                f"No active offers found for <b>{query}</b>.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🔍 Search again", callback_data="get_links")],
+                    [InlineKeyboardButton(text="◀️ Main menu", callback_data="main_menu")],
+                ]),
+            )
+            return
+
+        rows = []
+        for o in offers[:15]:
+            oid = str(o.get("id", ""))
+            name = o.get("name", f"Offer {oid}")
+            label = f"{name} ({oid})" if len(name) <= 35 else f"{name[:32]}… ({oid})"
+            rows.append([InlineKeyboardButton(
+                text=label, callback_data=f"links:{oid}"
+            )])
+        rows.append([InlineKeyboardButton(text="🔍 Search again", callback_data="get_links")])
+        rows.append([InlineKeyboardButton(text="◀️ Main menu", callback_data="main_menu")])
+
+        await status_msg.edit_text(
+            f"🔍 Results for <b>{query}</b>:\n\nSelect an offer to get tracking links.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        )
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Error: {e}", reply_markup=back_kb())
+
+
+@router.callback_query(F.data.startswith("links:"))
+async def cb_show_links(callback: CallbackQuery):
+    if not await require_auth(callback):
+        return
+    await callback.answer()
+
+    offer_id = callback.data.split(":", 1)[1]
+    uid = callback.from_user.id
+
+    await callback.message.edit_text("⏳ Fetching links...")
 
     try:
         offer = await api.get_offer_with_links(uid, offer_id)
         if not offer:
-            await status_msg.edit_text(
+            await callback.message.edit_text(
                 f"No offer found with ID {offer_id}.", reply_markup=back_kb()
             )
             return
@@ -255,7 +299,7 @@ async def process_get_links(message: Message, state: FSMContext):
         links = offer.get("links", [])
 
         if not links:
-            await status_msg.edit_text(
+            await callback.message.edit_text(
                 f"No links found for offer {offer_id}.", reply_markup=back_kb()
             )
             return
@@ -269,9 +313,16 @@ async def process_get_links(message: Message, state: FSMContext):
             star = "⭐ " if is_default else ""
             text += f"{star}<b>{name}</b> — <code>{deep_link}</code>\n\n"
 
-        await status_msg.edit_text(text[:4000], parse_mode="HTML", reply_markup=back_kb())
+        await callback.message.edit_text(
+            text[:4000],
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔍 Search again", callback_data="get_links")],
+                [InlineKeyboardButton(text="◀️ Main menu", callback_data="main_menu")],
+            ]),
+        )
     except Exception as e:
-        await status_msg.edit_text(f"❌ Error: {e}", reply_markup=back_kb())
+        await callback.message.edit_text(f"❌ Error: {e}", reply_markup=back_kb())
 
 
 # ── Create deeplink (enter offer ID → get base link → enter URL) ────────────
@@ -368,7 +419,7 @@ async def cmd_help(message: Message):
         "<b>How it works:</b>\n"
         "1. /connect — enter client_id + client_secret (OAuth 2.0)\n"
         "2. 📋 My offers — browse subscribed offers\n"
-        "3. 🔗 Get tracking links — enter Offer ID, get all links\n"
+        "3. 🔗 Get tracking links — search by name, select, get links\n"
         "4. 🌐 Create deeplink — base link + target URL",
         parse_mode="HTML",
     )

@@ -80,6 +80,23 @@ async def get_my_offers(telegram_id: int, limit: int = 50) -> list[dict]:
     return _extract_offers(data, key="offers")
 
 
+async def search_my_offers(telegram_id: int, query: str, limit: int = 20) -> list[dict]:
+    """Search subscribed offers by name (API-side substring match, case-insensitive)."""
+    data = await _v2_request(
+        telegram_id,
+        "offers/list",
+        params={
+            "name": query,
+            "user_has_offer": "true",
+            "limit": limit,
+            "sort": "name",
+            "sort_type": "asc",
+        },
+    )
+    offers = _extract_offers(data, key="offers")
+    return [o for o in offers if o.get("is_available")]
+
+
 async def get_offer_with_links(telegram_id: int, offer_id: str) -> dict | None:
     """Single offer with its tracking links via /v2/offers/list?ids=..."""
     data = await _v2_request(
