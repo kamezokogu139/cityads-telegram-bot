@@ -55,13 +55,6 @@ def back_kb() -> InlineKeyboardMarkup:
     ])
 
 
-def offers_menu_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔗 Get tracking links", callback_data="get_links")],
-        [InlineKeyboardButton(text="◀️ Main menu", callback_data="main_menu")],
-    ])
-
-
 # ── Auth helper ──────────────────────────────────────────────────────────────
 
 async def require_auth(event: Message | CallbackQuery) -> bool:
@@ -186,48 +179,17 @@ async def cmd_menu(message: Message):
     await message.answer("Choose an action:", reply_markup=main_menu_kb())
 
 
-# ── My offers → with "Get tracking links" button ────────────────────────────
+# ── My offers: search by ID or name → select → show tracking links ───────────
 
-@router.callback_query(F.data == "my_offers")
-async def cb_my_offers(callback: CallbackQuery):
-    if not await require_auth(callback):
-        return
-    await callback.answer()
-    try:
-        items = await api.get_my_offers(callback.from_user.id)
-        if not items:
-            await callback.message.edit_text("No connected offers.", reply_markup=back_kb())
-            return
-
-        text = "📋 <b>Your offers:</b>\n\n"
-        for i, o in enumerate(items[:20], 1):
-            name = o.get("name", "—")
-            oid = o.get("id", "")
-            site = o.get("site_url", "")
-            dl = "✅" if o.get("is_deeplink_enabled") else "❌"
-            text += f"{i}. <b>{name}</b> (ID: {oid})\n"
-            if site:
-                text += f"   🌐 {site}\n"
-            text += f"   Deeplink: {dl}\n\n"
-
-        await callback.message.edit_text(
-            text[:4000], parse_mode="HTML", reply_markup=offers_menu_kb()
-        )
-    except Exception as e:
-        await callback.message.edit_text(f"❌ Error: {e}", reply_markup=back_kb())
-
-
-# ── Get tracking links: search by name → select offer → show links ──────────
-
-@router.callback_query(F.data == "get_links")
-async def cb_get_links(callback: CallbackQuery, state: FSMContext):
+@router.callback_query(F.data.in_({"my_offers", "search_again"}))
+async def cb_my_offers(callback: CallbackQuery, state: FSMContext):
     if not await require_auth(callback):
         return
     await callback.answer()
     await state.set_state(GetLinksFlow.waiting_search)
     await callback.message.edit_text(
-        "🔍 <b>Search offer</b>\n\n"
-        "Type the offer name (or part of it).",
+        "📋 <b>My offers</b>\n\n"
+        "Enter the <b>offer ID</b> or <b>name</b> (or part of it).",
         parse_mode="HTML",
     )
 
@@ -235,12 +197,29 @@ async def cb_get_links(callback: CallbackQuery, state: FSMContext):
 @router.message(GetLinksFlow.waiting_search)
 async def process_search_offers(message: Message, state: FSMContext):
     query = message.text.strip()
+    uid = message.from_user.id
+
+    if query.isdigit():
+        await state.clear()
+        status_msg = await message.answer("⏳ Fetching links...")
+        try:
+            offer = await api.get_offer_with_links(uid, query)
+            if not offer:
+                await status_msg.edit_text(
+                    f"No offer found with ID {query}.",
+                    reply_markup=_search_back_kb(),
+                )
+                return
+            await _send_offer_links(status_msg, offer, query)
+        except Exception as e:
+            await status_msg.edit_text(f"❌ Error: {e}", reply_markup=back_kb())
+        return
+
     if len(query) < 2:
         await message.answer("⚠️ Enter at least 2 characters.")
         return
 
     await state.clear()
-    uid = message.from_user.id
     status_msg = await message.answer("⏳ Searching...")
 
     try:
@@ -249,10 +228,7 @@ async def process_search_offers(message: Message, state: FSMContext):
             await status_msg.edit_text(
                 f"No active offers found for <b>{query}</b>.",
                 parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="🔍 Search again", callback_data="get_links")],
-                    [InlineKeyboardButton(text="◀️ Main menu", callback_data="main_menu")],
-                ]),
+                reply_markup=_search_back_kb(),
             )
             return
 
@@ -264,7 +240,7 @@ async def process_search_offers(message: Message, state: FSMContext):
             rows.append([InlineKeyboardButton(
                 text=label, callback_data=f"links:{oid}"
             )])
-        rows.append([InlineKeyboardButton(text="🔍 Search again", callback_data="get_links")])
+        rows.append([InlineKeyboardButton(text="🔍 Search again", callback_data="search_again")])
         rows.append([InlineKeyboardButton(text="◀️ Main menu", callback_data="main_menu")])
 
         await status_msg.edit_text(
@@ -291,38 +267,41 @@ async def cb_show_links(callback: CallbackQuery):
         offer = await api.get_offer_with_links(uid, offer_id)
         if not offer:
             await callback.message.edit_text(
-                f"No offer found with ID {offer_id}.", reply_markup=back_kb()
+                f"No offer found with ID {offer_id}.", reply_markup=_search_back_kb()
             )
             return
-
-        offer_name = offer.get("name", "")
-        links = offer.get("links", [])
-
-        if not links:
-            await callback.message.edit_text(
-                f"No links found for offer {offer_id}.", reply_markup=back_kb()
-            )
-            return
-
-        header = f"🔗 <b>{offer_name}</b> (ID: {offer_id})\n\n" if offer_name else ""
-        text = header
-        for i, link in enumerate(links, 1):
-            name = link.get("name", f"Link {i}")
-            deep_link = link.get("deep_link", "—")
-            is_default = link.get("is_default", False)
-            star = "⭐ " if is_default else ""
-            text += f"{star}<b>{name}</b> — <code>{deep_link}</code>\n\n"
-
-        await callback.message.edit_text(
-            text[:4000],
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔍 Search again", callback_data="get_links")],
-                [InlineKeyboardButton(text="◀️ Main menu", callback_data="main_menu")],
-            ]),
-        )
+        await _send_offer_links(callback.message, offer, offer_id)
     except Exception as e:
         await callback.message.edit_text(f"❌ Error: {e}", reply_markup=back_kb())
+
+
+def _search_back_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔍 Search again", callback_data="search_again")],
+        [InlineKeyboardButton(text="◀️ Main menu", callback_data="main_menu")],
+    ])
+
+
+async def _send_offer_links(msg: Message, offer: dict, offer_id: str):
+    offer_name = offer.get("name", "")
+    links = offer.get("links", [])
+
+    if not links:
+        await msg.edit_text(
+            f"No links found for offer {offer_id}.", reply_markup=_search_back_kb()
+        )
+        return
+
+    header = f"🔗 <b>{offer_name}</b> (ID: {offer_id})\n\n" if offer_name else ""
+    text = header
+    for i, link in enumerate(links, 1):
+        name = link.get("name", f"Link {i}")
+        deep_link = link.get("deep_link", "—")
+        is_default = link.get("is_default", False)
+        star = "⭐ " if is_default else ""
+        text += f"{star}<b>{name}</b> — <code>{deep_link}</code>\n\n"
+
+    await msg.edit_text(text[:4000], parse_mode="HTML", reply_markup=_search_back_kb())
 
 
 # ── Create deeplink (enter offer ID → get base link → enter URL) ────────────
@@ -418,9 +397,8 @@ async def cmd_help(message: Message):
         "/help — This help\n\n"
         "<b>How it works:</b>\n"
         "1. /connect — enter client_id + client_secret (OAuth 2.0)\n"
-        "2. 📋 My offers — browse subscribed offers\n"
-        "3. 🔗 Get tracking links — search by name, select, get links\n"
-        "4. 🌐 Create deeplink — base link + target URL",
+        "2. 📋 My offers — search by ID or name, get tracking links\n"
+        "3. 🌐 Create deeplink — base link + target URL",
         parse_mode="HTML",
     )
 
