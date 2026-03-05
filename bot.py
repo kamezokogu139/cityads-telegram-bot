@@ -10,7 +10,10 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
     Message,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
 )
 
 import cityads_api as api
@@ -41,15 +44,48 @@ class DeeplinkFlow(StatesGroup):
 
 # ── Keyboards ────────────────────────────────────────────────────────────────
 
-def main_menu_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📋 My offers", callback_data="my_offers")],
-        [InlineKeyboardButton(text="🌐 Create deeplink", callback_data="make_deeplink")],
-        [InlineKeyboardButton(text="⚙️ Disconnect", callback_data="disconnect")],
-    ])
+BTN_CONNECT = "🔗 Connect"
+BTN_MY_OFFERS = "📋 My available offers"
+BTN_CREATE_DEEPLINK = "🌐 Create deeplink"
+BTN_SETTINGS = "⚙️ Settings"
+BTN_BACK = "◀️ Back"
+BTN_HELP = "❓ Help"
+BTN_DISCONNECT = "🔌 Disconnect"
+
+def connect_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=BTN_CONNECT)]],
+        resize_keyboard=True,
+        one_time_keyboard=False,
+    )
 
 
-def back_kb() -> InlineKeyboardMarkup:
+def main_menu_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=BTN_MY_OFFERS)],
+            [KeyboardButton(text=BTN_CREATE_DEEPLINK)],
+            [KeyboardButton(text=BTN_SETTINGS)],
+            [KeyboardButton(text=BTN_BACK)],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=False,
+    )
+
+
+def settings_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=BTN_HELP)],
+            [KeyboardButton(text=BTN_DISCONNECT)],
+            [KeyboardButton(text=BTN_BACK)],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=False,
+    )
+
+
+def _inline_back_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="◀️ Main menu", callback_data="main_menu")],
     ])
@@ -61,7 +97,7 @@ async def require_auth(event: Message | CallbackQuery) -> bool:
     uid = event.from_user.id
     if await db.is_connected(uid):
         return True
-    text = "⚠️ Account not connected.\nUse /connect to link your CityAds account."
+    text = "⚠️ Account not connected.\nUse the Connect button to link your CityAds account."
     if isinstance(event, CallbackQuery):
         await event.answer(text, show_alert=True)
     else:
@@ -78,24 +114,32 @@ async def cmd_start(message: Message):
     else:
         await message.answer(
             "👋 Hi! I'm a CityAds link bot.\n\n"
-            "/connect — link your CityAds account\n\n"
+            "Use the <b>Connect</b> button to link your CityAds account.\n\n"
             "You'll need:\n"
             "• <b>client_id</b>\n"
             "• <b>client_secret</b>\n\n"
             "Get them at: https://cityads.com/publisher/api",
             parse_mode="HTML",
+            reply_markup=connect_kb(),
         )
 
 
-# ── /connect (2 steps: client_id → client_secret) ───────────────────────────
+# ── Connect (2 steps: client_id → client_secret) ──────────────────────────────
 
 @router.message(Command("connect"))
+@router.message(F.text == BTN_CONNECT)
 async def cmd_connect(message: Message, state: FSMContext):
+    if await state.get_state() and "ConnectFlow" in str(await state.get_state()):
+        return
+    if await db.is_connected(message.from_user.id):
+        await message.answer("Already connected.", reply_markup=main_menu_kb())
+        return
     await state.set_state(ConnectFlow.waiting_client_id)
     await message.answer(
         "🔐 Step 1/2: Send your <b>client_id</b>.\n\n"
         "https://cityads.com/publisher/api",
         parse_mode="HTML",
+        reply_markup=ReplyKeyboardRemove(),
     )
 
 
@@ -131,9 +175,10 @@ async def process_client_secret(message: Message, state: FSMContext):
         token, expires_in = await api._fetch_new_token(client_id, client_secret)
     except Exception as e:
         await status_msg.edit_text(
-            f"❌ OAuth failed:\n<code>{e}</code>\n\nTry again: /connect",
+            f"❌ OAuth failed:\n<code>{e}</code>\n\nTry again using the Connect button.",
             parse_mode="HTML",
         )
+        await message.answer("Use the Connect button to try again.", reply_markup=connect_kb())
         await state.clear()
         return
 
@@ -155,21 +200,25 @@ async def process_client_secret(message: Message, state: FSMContext):
 @router.message(Command("disconnect"))
 async def cmd_disconnect(message: Message):
     await db.delete_user(message.from_user.id)
-    await message.answer("🗑 Disconnected. All data deleted.\n/connect — connect again.")
-
-
-@router.callback_query(F.data == "disconnect")
-async def cb_disconnect(callback: CallbackQuery):
-    await db.delete_user(callback.from_user.id)
-    await callback.message.edit_text("🗑 Disconnected.\n/connect — connect again.")
+    await message.answer(
+        "🗑 Disconnected. All data deleted.",
+        reply_markup=connect_kb(),
+    )
 
 
 # ── Main menu ────────────────────────────────────────────────────────────────
 
+@router.message(F.text == BTN_BACK)
+async def msg_back(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Choose an action:", reply_markup=main_menu_kb())
+
+
 @router.callback_query(F.data == "main_menu")
 async def cb_main_menu(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
     await state.clear()
-    await callback.message.edit_text("Choose an action:", reply_markup=main_menu_kb())
+    await callback.message.edit_text("Choose an action:")
 
 
 @router.message(Command("menu"))
@@ -179,19 +228,77 @@ async def cmd_menu(message: Message):
     await message.answer("Choose an action:", reply_markup=main_menu_kb())
 
 
+# ── Settings (Help, Disconnect) ───────────────────────────────────────────────
+
+@router.message(F.text == BTN_SETTINGS)
+async def msg_settings(message: Message):
+    if not await require_auth(message):
+        return
+    await message.answer(
+        "⚙️ <b>Settings</b>\n\n"
+        "Choose an option:",
+        parse_mode="HTML",
+        reply_markup=settings_kb(),
+    )
+
+
+@router.message(F.text == BTN_HELP)
+async def msg_help(message: Message):
+    if not await require_auth(message):
+        return
+    await message.answer(
+        "<b>❓ Help</b>\n\n"
+        "<b>Commands:</b>\n"
+        "/start — Restart bot, show main menu\n"
+        "/menu — Open main menu\n"
+        "/disconnect — Unlink CityAds account and delete data\n"
+        "/help — This help\n\n"
+        "<b>Main menu:</b>\n"
+        "• My available offers — search by ID or name, get tracking links\n"
+        "• Create deeplink — search offer, enter target URL, get deeplink",
+        parse_mode="HTML",
+        reply_markup=settings_kb(),
+    )
+
+
+@router.message(F.text == BTN_DISCONNECT)
+async def msg_disconnect(message: Message):
+    if not await require_auth(message):
+        return
+    await db.delete_user(message.from_user.id)
+    await message.answer(
+        "🗑 Disconnected. All data deleted.",
+        reply_markup=connect_kb(),
+    )
+
+
 # ── My offers: search by ID or name → select → show tracking links ───────────
 
-@router.callback_query(F.data.in_({"my_offers", "search_again"}))
-async def cb_my_offers(callback: CallbackQuery, state: FSMContext):
+async def _start_my_offers(target: Message | CallbackQuery, state: FSMContext):
+    await state.set_state(GetLinksFlow.waiting_search)
+    text = (
+        "📋 <b>My available offers</b>\n\n"
+        "Enter the <b>offer ID</b> or <b>name</b> (or part of it)."
+    )
+    if isinstance(target, CallbackQuery):
+        await target.answer()
+        await target.message.edit_text(text, parse_mode="HTML")
+    else:
+        await target.answer(text, parse_mode="HTML")
+
+
+@router.message(F.text == BTN_MY_OFFERS)
+async def msg_my_offers(message: Message, state: FSMContext):
+    if not await require_auth(message):
+        return
+    await _start_my_offers(message, state)
+
+
+@router.callback_query(F.data == "search_again")
+async def cb_search_again(callback: CallbackQuery, state: FSMContext):
     if not await require_auth(callback):
         return
-    await callback.answer()
-    await state.set_state(GetLinksFlow.waiting_search)
-    await callback.message.edit_text(
-        "📋 <b>My offers</b>\n\n"
-        "Enter the <b>offer ID</b> or <b>name</b> (or part of it).",
-        parse_mode="HTML",
-    )
+    await _start_my_offers(callback, state)
 
 
 @router.message(GetLinksFlow.waiting_search)
@@ -212,7 +319,7 @@ async def process_search_offers(message: Message, state: FSMContext):
                 return
             await _send_offer_links(status_msg, offer, query)
         except Exception as e:
-            await status_msg.edit_text(f"❌ Error: {e}", reply_markup=back_kb())
+            await status_msg.edit_text(f"❌ Error: {e}", reply_markup=_inline_back_kb())
         return
 
     if len(query) < 2:
@@ -249,7 +356,7 @@ async def process_search_offers(message: Message, state: FSMContext):
             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
         )
     except Exception as e:
-        await status_msg.edit_text(f"❌ Error: {e}", reply_markup=back_kb())
+        await status_msg.edit_text(f"❌ Error: {e}", reply_markup=_inline_back_kb())
 
 
 @router.callback_query(F.data.startswith("links:"))
@@ -272,7 +379,7 @@ async def cb_show_links(callback: CallbackQuery):
             return
         await _send_offer_links(callback.message, offer, offer_id)
     except Exception as e:
-        await callback.message.edit_text(f"❌ Error: {e}", reply_markup=back_kb())
+        await callback.message.edit_text(f"❌ Error: {e}", reply_markup=_inline_back_kb())
 
 
 def _search_back_kb() -> InlineKeyboardMarkup:
@@ -310,19 +417,33 @@ async def _send_offer_links(msg: Message, offer: dict, offer_id: str):
     await msg.edit_text(text, parse_mode="HTML", reply_markup=_search_back_kb())
 
 
-# ── Create deeplink (enter offer ID → get base link → enter URL) ────────────
+# ── Create deeplink (search offer → get base link → enter URL) ─────────────────
 
-@router.callback_query(F.data.in_({"make_deeplink", "dl_search_again"}))
-async def cb_make_deeplink(callback: CallbackQuery, state: FSMContext):
+async def _start_create_deeplink(target: Message | CallbackQuery, state: FSMContext):
+    await state.set_state(DeeplinkFlow.waiting_offer_id)
+    text = (
+        "🌐 <b>Create deeplink</b>\n\n"
+        "Enter the <b>offer ID</b> or <b>name</b> (or part of it)."
+    )
+    if isinstance(target, CallbackQuery):
+        await target.answer()
+        await target.message.edit_text(text, parse_mode="HTML")
+    else:
+        await target.answer(text, parse_mode="HTML")
+
+
+@router.message(F.text == BTN_CREATE_DEEPLINK)
+async def msg_create_deeplink(message: Message, state: FSMContext):
+    if not await require_auth(message):
+        return
+    await _start_create_deeplink(message, state)
+
+
+@router.callback_query(F.data == "dl_search_again")
+async def cb_dl_search_again(callback: CallbackQuery, state: FSMContext):
     if not await require_auth(callback):
         return
-    await callback.answer()
-    await state.set_state(DeeplinkFlow.waiting_offer_id)
-    await callback.message.edit_text(
-        "🌐 <b>Create deeplink</b>\n\n"
-        "Enter the <b>offer ID</b> or <b>name</b> (or part of it).",
-        parse_mode="HTML",
-    )
+    await _start_create_deeplink(callback, state)
 
 
 def _deeplink_back_kb() -> InlineKeyboardMarkup:
@@ -465,7 +586,7 @@ async def process_deeplink_url(message: Message, state: FSMContext):
     await message.answer(
         f"✅ <b>Your deeplink:</b>\n\n<code>{deeplink}</code>",
         parse_mode="HTML",
-        reply_markup=back_kb(),
+        reply_markup=main_menu_kb(),
     )
 
 
