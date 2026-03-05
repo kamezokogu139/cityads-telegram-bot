@@ -312,7 +312,7 @@ async def _send_offer_links(msg: Message, offer: dict, offer_id: str):
 
 # ── Create deeplink (enter offer ID → get base link → enter URL) ────────────
 
-@router.callback_query(F.data == "make_deeplink")
+@router.callback_query(F.data.in_({"make_deeplink", "dl_search_again"}))
 async def cb_make_deeplink(callback: CallbackQuery, state: FSMContext):
     if not await require_auth(callback):
         return
@@ -320,55 +320,134 @@ async def cb_make_deeplink(callback: CallbackQuery, state: FSMContext):
     await state.set_state(DeeplinkFlow.waiting_offer_id)
     await callback.message.edit_text(
         "🌐 <b>Create deeplink</b>\n\n"
-        "Send the <b>Offer ID</b>.",
+        "Enter the <b>offer ID</b> or <b>name</b> (or part of it).",
+        parse_mode="HTML",
+    )
+
+
+def _deeplink_back_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔍 Search again", callback_data="dl_search_again")],
+        [InlineKeyboardButton(text="◀️ Main menu", callback_data="main_menu")],
+    ])
+
+
+async def _dl_set_base_and_ask_url(status_msg: Message, state: FSMContext, base: str):
+    await state.set_state(DeeplinkFlow.waiting_url)
+    await state.update_data(dl_base_link=base)
+    await status_msg.edit_text(
+        f"✅ Base link: <code>{base}</code>\n\n"
+        "Now send the <b>target URL</b> for the deeplink.",
         parse_mode="HTML",
     )
 
 
 @router.message(DeeplinkFlow.waiting_offer_id)
 async def process_dl_offer_id(message: Message, state: FSMContext):
-    offer_id = message.text.strip()
-    if not offer_id.isdigit():
-        await message.answer("⚠️ Offer ID should be a number. Try again.")
+    query = message.text.strip()
+    uid = message.from_user.id
+
+    if query.isdigit():
+        status_msg = await message.answer("⏳ Fetching offer links...")
+        try:
+            offer = await api.get_offer_with_links(uid, query)
+            if not offer:
+                await status_msg.edit_text(
+                    f"No offer found with ID {query}.", reply_markup=_deeplink_back_kb()
+                )
+                return
+
+            links = offer.get("links", [])
+            if not links:
+                await status_msg.edit_text(
+                    f"No links for offer {query}.", reply_markup=_deeplink_back_kb()
+                )
+                return
+
+            default_link = next((l for l in links if l.get("is_default")), links[0])
+            base = default_link.get("deep_link", "")
+            if not base:
+                await status_msg.edit_text("❌ No base link found.", reply_markup=_deeplink_back_kb())
+                return
+
+            await _dl_set_base_and_ask_url(status_msg, state, base)
+        except Exception as e:
+            await status_msg.edit_text(f"❌ Error: {e}", reply_markup=_deeplink_back_kb())
+            await state.clear()
         return
 
-    uid = message.from_user.id
-    status_msg = await message.answer("⏳ Fetching offer links...")
+    if len(query) < 2:
+        await message.answer("⚠️ Enter at least 2 characters.")
+        return
+
+    await state.clear()
+    status_msg = await message.answer("⏳ Searching...")
+
+    try:
+        offers = await api.search_my_offers(uid, query)
+        if not offers:
+            await status_msg.edit_text(
+                f"No active offers found for <b>{query}</b>.",
+                parse_mode="HTML",
+                reply_markup=_deeplink_back_kb(),
+            )
+            return
+
+        rows = []
+        for o in offers[:15]:
+            oid = str(o.get("id", ""))
+            name = o.get("name", f"Offer {oid}")
+            label = f"{name} ({oid})" if len(name) <= 35 else f"{name[:32]}… ({oid})"
+            rows.append([InlineKeyboardButton(
+                text=label, callback_data=f"dl_select:{oid}"
+            )])
+        rows.append([InlineKeyboardButton(text="🔍 Search again", callback_data="dl_search_again")])
+        rows.append([InlineKeyboardButton(text="◀️ Main menu", callback_data="main_menu")])
+
+        await status_msg.edit_text(
+            f"🔍 Results for <b>{query}</b>:\n\nSelect an offer to create a deeplink.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        )
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Error: {e}", reply_markup=_deeplink_back_kb())
+
+
+@router.callback_query(F.data.startswith("dl_select:"))
+async def cb_dl_select_offer(callback: CallbackQuery, state: FSMContext):
+    if not await require_auth(callback):
+        return
+    await callback.answer()
+
+    offer_id = callback.data.split(":", 1)[1]
+    uid = callback.from_user.id
+
+    await callback.message.edit_text("⏳ Fetching offer links...")
 
     try:
         offer = await api.get_offer_with_links(uid, offer_id)
         if not offer:
-            await status_msg.edit_text(
-                f"No offer found with ID {offer_id}.", reply_markup=back_kb()
+            await callback.message.edit_text(
+                f"No offer found with ID {offer_id}.", reply_markup=_deeplink_back_kb()
             )
-            await state.clear()
             return
 
         links = offer.get("links", [])
         if not links:
-            await status_msg.edit_text(
-                f"No links for offer {offer_id}.", reply_markup=back_kb()
+            await callback.message.edit_text(
+                f"No links for offer {offer_id}.", reply_markup=_deeplink_back_kb()
             )
-            await state.clear()
             return
 
         default_link = next((l for l in links if l.get("is_default")), links[0])
         base = default_link.get("deep_link", "")
         if not base:
-            await status_msg.edit_text("❌ No base link found.", reply_markup=back_kb())
-            await state.clear()
+            await callback.message.edit_text("❌ No base link found.", reply_markup=_deeplink_back_kb())
             return
 
-        await state.set_state(DeeplinkFlow.waiting_url)
-        await state.update_data(dl_base_link=base)
-        await status_msg.edit_text(
-            f"✅ Base link: <code>{base}</code>\n\n"
-            "Now send the <b>target URL</b> for the deeplink.",
-            parse_mode="HTML",
-        )
+        await _dl_set_base_and_ask_url(callback.message, state, base)
     except Exception as e:
-        await status_msg.edit_text(f"❌ Error: {e}", reply_markup=back_kb())
-        await state.clear()
+        await callback.message.edit_text(f"❌ Error: {e}", reply_markup=_deeplink_back_kb())
 
 
 @router.message(DeeplinkFlow.waiting_url)
@@ -404,7 +483,7 @@ async def cmd_help(message: Message):
         "<b>How it works:</b>\n"
         "1. /connect — enter client_id + client_secret (OAuth 2.0)\n"
         "2. 📋 My offers — search by ID or name, get tracking links\n"
-        "3. 🌐 Create deeplink — base link + target URL",
+        "3. 🌐 Create deeplink — search by ID or name, then enter target URL",
         parse_mode="HTML",
     )
 
