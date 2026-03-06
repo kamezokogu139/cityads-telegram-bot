@@ -1,9 +1,12 @@
+import asyncio
 import json
 import time
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlencode, quote
 
 import aiohttp
+import requests
 from config import CITYADS_AUTH_URL, CITYADS_API_BASE
 import db
 
@@ -123,29 +126,36 @@ def _extract_offers(data, *, key: str = "offers") -> list[dict]:
 # ── Link shortener ────────────────────────────────────────────────────────────
 
 SHORTLINK_URL = "https://cityads.com/saduka/shortLink"
+SHORTLINK_TIMEOUT = 15
+_shorten_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="shorten")
 
 
-async def shorten_link(url: str) -> str:
-    """Shorten URL via CityAds shortLink API. Returns original URL on failure."""
-    if not url or not url.startswith(("http://", "https://")):
-        return url
+def _shorten_sync(url: str) -> str:
+    """Sync shortLink request — runs in thread, avoids aiogram event loop conflict."""
     try:
-        payload = {"urls": url}
-        async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False)) as session:
-            async with session.post(
-                SHORTLINK_URL,
-                json=payload,
-                headers={"content-type": "application/json"},
-            ) as resp:
-                if resp.status != 200:
-                    logger.warning("shortLink API error %s: %s", resp.status, await resp.text())
-                    return url
-                data = await resp.json()
-                short = _extract_short_url(data)
-                return short if short else url
+        resp = requests.post(
+            SHORTLINK_URL,
+            json={"urls": url},
+            headers={"content-type": "application/json"},
+            timeout=SHORTLINK_TIMEOUT,
+        )
+        if resp.status_code != 200:
+            logger.warning("shortLink API error %s: %s", resp.status_code, resp.text[:100])
+            return url
+        data = resp.json()
+        short = _extract_short_url(data)
+        return short if short else url
     except Exception as e:
         logger.warning("shortLink failed for %s: %s", url[:50], e)
         return url
+
+
+async def shorten_link(url: str) -> str:
+    """Shorten URL via CityAds shortLink API. Uses thread to avoid event loop hang."""
+    if not url or not url.startswith(("http://", "https://")):
+        return url
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_shorten_executor, _shorten_sync, url)
 
 
 def _extract_short_url(data: dict | list) -> str | None:
