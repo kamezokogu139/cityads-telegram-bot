@@ -1,12 +1,13 @@
 import asyncio
 import json
+import ssl
 import time
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlencode, quote
+from urllib.request import Request, urlopen
 
 import aiohttp
-import requests
 from config import CITYADS_AUTH_URL, CITYADS_API_BASE
 import db
 
@@ -131,18 +132,16 @@ _shorten_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="shorte
 
 
 def _shorten_sync(url: str) -> str:
-    """Sync shortLink request — runs in thread, avoids aiogram event loop conflict."""
+    """Sync shortLink request via urllib — runs in thread, no aiohttp/requests."""
     try:
-        resp = requests.post(
-            SHORTLINK_URL,
-            json={"urls": url},
-            headers={"content-type": "application/json"},
-            timeout=SHORTLINK_TIMEOUT,
-        )
-        if resp.status_code != 200:
-            logger.warning("shortLink API error %s: %s", resp.status_code, resp.text[:100])
-            return url
-        data = resp.json()
+        body = json.dumps({"urls": url}).encode("utf-8")
+        req = Request(SHORTLINK_URL, data=body, method="POST")
+        req.add_header("content-type", "application/json")
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        with urlopen(req, timeout=SHORTLINK_TIMEOUT, context=ctx) as resp:
+            data = json.loads(resp.read().decode())
         short = _extract_short_url(data)
         return short if short else url
     except Exception as e:
@@ -155,7 +154,14 @@ async def shorten_link(url: str) -> str:
     if not url or not url.startswith(("http://", "https://")):
         return url
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(_shorten_executor, _shorten_sync, url)
+    try:
+        return await asyncio.wait_for(
+            loop.run_in_executor(_shorten_executor, _shorten_sync, url),
+            timeout=SHORTLINK_TIMEOUT + 5,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("shortLink timeout for %s", url[:50])
+        return url
 
 
 def _extract_short_url(data: dict | list) -> str | None:

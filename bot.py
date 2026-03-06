@@ -579,22 +579,29 @@ async def cb_dl_select_offer(callback: CallbackQuery, state: FSMContext):
 
 @router.message(DeeplinkFlow.waiting_url)
 async def process_deeplink_url(message: Message, state: FSMContext):
-    url = message.text.strip()
+    url = (message.text or "").strip()
     if not url.startswith(("http://", "https://")):
         await message.answer("⚠️ Send a valid URL starting with http:// or https://")
         return
 
     data = await state.get_data()
-    base = data["dl_base_link"]
+    base = data.get("dl_base_link", "")
     await state.clear()
+    if not base:
+        await message.answer("❌ Session expired. Start again.", reply_markup=main_menu_kb())
+        return
 
     deeplink = api.build_deeplink(base, url)
     status_msg = await message.answer("⏳ Shortening link...", reply_markup=main_menu_kb())
-    short_link = await api.shorten_link(deeplink)
+    try:
+        short_link = await api.shorten_link(deeplink)
+        result = short_link if short_link != deeplink else deeplink
+    except Exception as e:
+        logger.exception("shorten_link error: %s", e)
+        result = deeplink
     await status_msg.edit_text(
-        f"✅ <b>Your deeplink:</b>\n\n<code>{short_link}</code>",
+        f"✅ <b>Your deeplink:</b>\n\n<code>{result}</code>",
         parse_mode="HTML",
-        reply_markup=main_menu_kb(),
     )
 
 
