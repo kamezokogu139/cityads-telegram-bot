@@ -592,16 +592,17 @@ async def process_deeplink_url(message: Message, state: FSMContext):
         return
 
     deeplink = api.build_deeplink(base, url)
-    status_msg = await message.answer("⏳ Shortening link...", reply_markup=main_menu_kb())
+    await message.answer("⏳ Shortening link...", reply_markup=main_menu_kb())
     try:
         short_link = await api.shorten_link(deeplink)
         result = short_link if short_link != deeplink else deeplink
     except Exception as e:
         logger.exception("shorten_link error: %s", e)
         result = deeplink
-    await status_msg.edit_text(
+    await message.answer(
         f"✅ <b>Your deeplink:</b>\n\n<code>{result}</code>",
         parse_mode="HTML",
+        reply_markup=main_menu_kb(),
     )
 
 
