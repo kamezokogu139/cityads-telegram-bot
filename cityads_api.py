@@ -120,6 +120,57 @@ def _extract_offers(data, *, key: str = "offers") -> list[dict]:
     return []
 
 
+# ── Link shortener ────────────────────────────────────────────────────────────
+
+SHORTLINK_URL = "https://cityads.com/saduka/shortLink"
+
+
+async def shorten_link(url: str) -> str:
+    """Shorten URL via CityAds shortLink API. Returns original URL on failure."""
+    if not url or not url.startswith(("http://", "https://")):
+        return url
+    try:
+        payload = {"urls": url}
+        async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False)) as session:
+            async with session.post(
+                SHORTLINK_URL,
+                json=payload,
+                headers={"content-type": "application/json"},
+            ) as resp:
+                if resp.status != 200:
+                    logger.warning("shortLink API error %s: %s", resp.status, await resp.text())
+                    return url
+                data = await resp.json()
+                short = _extract_short_url(data)
+                return short if short else url
+    except Exception as e:
+        logger.warning("shortLink failed for %s: %s", url[:50], e)
+        return url
+
+
+def _extract_short_url(data: dict | list) -> str | None:
+    """Extract shortened URL from API response.
+    API returns: {"shortLink": {"original_url": "https://lnk.do/xxx"}}
+    """
+    if isinstance(data, str):
+        return data if data.startswith("http") else None
+    if isinstance(data, list) and data:
+        item = data[0]
+        return item if isinstance(item, str) and item.startswith("http") else _extract_short_url(item)
+    if isinstance(data, dict):
+        # CityAds format: {"shortLink": {"orig": "shortened"}}
+        short_link = data.get("shortLink")
+        if isinstance(short_link, dict) and short_link:
+            return next((v for v in short_link.values() if isinstance(v, str) and v.startswith("http")), None)
+        for key in ("urls", "short_url", "shortUrl", "short_link", "url", "link"):
+            val = data.get(key)
+            if isinstance(val, str) and val.startswith("http"):
+                return val
+            if isinstance(val, list) and val:
+                return _extract_short_url(val[0])
+    return None
+
+
 # ── Link builders ────────────────────────────────────────────────────────────
 
 def build_deeplink(base_link: str, target_url: str, sub1: str = "", sub2: str = "") -> str:

@@ -399,15 +399,21 @@ async def _send_offer_links(msg: Message, offer: dict, offer_id: str):
         )
         return
 
+    await msg.edit_text("⏳ Shortening links...", reply_markup=_search_back_kb())
+    short_tasks = [api.shorten_link(link.get("deep_link", "")) for link in links]
+    shortened = await asyncio.gather(*short_tasks, return_exceptions=True)
+
     header = f"🔗 <b>{offer_name}</b> (ID: {offer_id})\n\n" if offer_name else ""
     text = header
     shown = 0
-    for i, link in enumerate(links, 1):
+    for i, link in enumerate(links):
         name = link.get("name", f"Link {i}")
-        deep_link = link.get("deep_link", "—")
+        orig = link.get("deep_link", "—")
+        short = shortened[i] if i < len(shortened) and not isinstance(shortened[i], Exception) else orig
+        display = short if isinstance(short, str) else orig
         is_default = link.get("is_default", False)
         star = "⭐ " if is_default else ""
-        line = f"{star}<b>{name}</b> — <code>{deep_link}</code>\n\n"
+        line = f"{star}<b>{name}</b> — <code>{display}</code>\n\n"
         if len(text) + len(line) > 3900:
             text += f"… and {len(links) - shown} more links"
             break
@@ -583,8 +589,10 @@ async def process_deeplink_url(message: Message, state: FSMContext):
     await state.clear()
 
     deeplink = api.build_deeplink(base, url)
-    await message.answer(
-        f"✅ <b>Your deeplink:</b>\n\n<code>{deeplink}</code>",
+    status_msg = await message.answer("⏳ Shortening link...", reply_markup=main_menu_kb())
+    short_link = await api.shorten_link(deeplink)
+    await status_msg.edit_text(
+        f"✅ <b>Your deeplink:</b>\n\n<code>{short_link}</code>",
         parse_mode="HTML",
         reply_markup=main_menu_kb(),
     )
