@@ -1,5 +1,7 @@
 import aiosqlite
-from config import DB_PATH, FERNET
+from datetime import datetime, timezone
+
+from config import DB_PATH, FERNET, SEEDANCE_MONTHLY_CREDITS
 
 
 async def init_db():
@@ -113,6 +115,44 @@ async def set_kv(key: str, value: str):
 
 
 SEEDANCE_CREDITS_KEY = "seedance_credits_available"
+SEEDANCE_USER_CREDITS_PREFIX = "seedance_user_credits:"
+SEEDANCE_USER_PERIOD_PREFIX = "seedance_user_period:"
+
+
+def _current_credit_period() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m")
+
+
+async def get_user_credits(telegram_id: int) -> int:
+    """Return user's remaining credits for the current month (auto-reset)."""
+    period_key = f"{SEEDANCE_USER_PERIOD_PREFIX}{telegram_id}"
+    credits_key = f"{SEEDANCE_USER_CREDITS_PREFIX}{telegram_id}"
+    current_period = _current_credit_period()
+    stored_period = await get_kv(period_key)
+
+    if stored_period != current_period:
+        await set_kv(period_key, current_period)
+        await set_kv(credits_key, str(SEEDANCE_MONTHLY_CREDITS))
+        return SEEDANCE_MONTHLY_CREDITS
+
+    raw = await get_kv(credits_key)
+    if raw is None:
+        await set_kv(period_key, current_period)
+        await set_kv(credits_key, str(SEEDANCE_MONTHLY_CREDITS))
+        return SEEDANCE_MONTHLY_CREDITS
+    try:
+        return int(raw)
+    except ValueError:
+        await set_kv(credits_key, str(SEEDANCE_MONTHLY_CREDITS))
+        return SEEDANCE_MONTHLY_CREDITS
+
+
+async def deduct_user_credits(telegram_id: int, amount: int) -> int:
+    """Deduct credits after a successful generation; returns new balance."""
+    current = await get_user_credits(telegram_id)
+    updated = max(0, current - amount)
+    await set_kv(f"{SEEDANCE_USER_CREDITS_PREFIX}{telegram_id}", str(updated))
+    return updated
 
 
 async def get_seedance_credits() -> int | None:

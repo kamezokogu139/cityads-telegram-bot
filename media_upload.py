@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import mimetypes
 import uuid
 from pathlib import Path
@@ -16,6 +17,8 @@ from config import (
     media_upload_configured,
 )
 
+logger = logging.getLogger(__name__)
+
 
 class MediaUploadError(RuntimeError):
     pass
@@ -24,6 +27,28 @@ class MediaUploadError(RuntimeError):
 def _guess_content_type(path: Path) -> str:
     mime, _ = mimetypes.guess_type(path.name)
     return mime or "application/octet-stream"
+
+
+def _s3_client():
+    import boto3
+    from botocore.config import Config
+
+    client_kwargs: dict = {
+        "aws_access_key_id": S3_ACCESS_KEY,
+        "aws_secret_access_key": S3_SECRET_KEY,
+        "config": Config(signature_version="s3v4"),
+    }
+    if S3_ENDPOINT:
+        client_kwargs["endpoint_url"] = S3_ENDPOINT
+    return boto3.client("s3", **client_kwargs)
+
+
+def _key_from_public_url(url: str) -> str | None:
+    base = S3_PUBLIC_BASE_URL.rstrip("/")
+    prefix = f"{base}/"
+    if not url.startswith(prefix):
+        return None
+    return url[len(prefix):]
 
 
 async def upload_file(path: str | Path) -> str:
@@ -42,18 +67,7 @@ async def upload_file(path: str | Path) -> str:
     content_type = _guess_content_type(path)
 
     def _upload() -> str:
-        import boto3
-        from botocore.config import Config
-
-        client_kwargs: dict = {
-            "aws_access_key_id": S3_ACCESS_KEY,
-            "aws_secret_access_key": S3_SECRET_KEY,
-            "config": Config(signature_version="s3v4"),
-        }
-        if S3_ENDPOINT:
-            client_kwargs["endpoint_url"] = S3_ENDPOINT
-
-        client = boto3.client("s3", **client_kwargs)
+        client = _s3_client()
         with path.open("rb") as f:
             client.upload_fileobj(
                 f,
@@ -66,3 +80,27 @@ async def upload_file(path: str | Path) -> str:
         return f"{base}/{key}"
 
     return await asyncio.to_thread(_upload)
+
+
+async def delete_file(url: str) -> None:
+    """Delete an object from R2/S3 by its public URL."""
+    if not media_upload_configured():
+        return
+    key = _key_from_public_url(url)
+    if not key:
+        logger.warning("Skip R2 delete, unknown URL: %s", url)
+        return
+
+    def _delete() -> None:
+        _s3_client().delete_object(Bucket=S3_BUCKET, Key=key)
+
+    await asyncio.to_thread(_delete)
+    logger.info("Deleted R2 object: %s", key)
+
+
+async def delete_files(urls: list[str]) -> None:
+    for url in urls:
+        try:
+            await delete_file(url)
+        except Exception as e:
+            logger.warning("Failed to delete R2 object %s: %s", url, e)

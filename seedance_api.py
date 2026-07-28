@@ -15,6 +15,7 @@ from seedance_models import ModelSpec, ModeSpec, build_input
 logger = logging.getLogger(__name__)
 
 POLL_INTERVAL_SEC = 10
+HTTP_TIMEOUT = aiohttp.ClientTimeout(total=120, connect=30, sock_read=90)
 
 
 class SeedanceError(RuntimeError):
@@ -132,6 +133,7 @@ async def poll_task(
     while time.monotonic() < deadline:
         task = await get_task_status(session, task_id)
         status = task.get("status", "")
+        logger.info("Seedance task %s status=%s", task_id, status or "unknown")
         if on_status:
             await on_status(status, task)
         if status == "completed":
@@ -172,7 +174,7 @@ async def generate_video(
         model.api_model,
         mode.generation_type,
     )
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session:
         task_id, credits = await create_video_task(session, model, input_payload)
         if on_task_created:
             await on_task_created(task_id, credits)

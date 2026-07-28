@@ -25,7 +25,7 @@ import cityads_api as api
 import db
 import media_upload
 import seedance_api as sd
-from config import BOT_TOKEN, SEEDANCE_INITIAL_CREDITS, media_upload_configured, seedance_configured
+from config import BOT_TOKEN, SEEDANCE_MONTHLY_CREDITS, media_upload_configured, seedance_configured
 from seedance_models import (
     DEFAULT_MODEL_ID,
     MODE_ORDER,
@@ -44,6 +44,7 @@ router = Router()
 
 # One active generation job per telegram user
 _active_gen_jobs: set[int] = set()
+_bg_tasks: set[asyncio.Task] = set()
 MAX_MEDIA_BYTES = 45 * 1024 * 1024  # stay under Telegram Bot API ~50MB
 
 
@@ -70,14 +71,30 @@ class GenerateFlow(StatesGroup):
 
 # ── Keyboards ────────────────────────────────────────────────────────────────
 
-BTN_CONNECT = "Connect"
-BTN_GENERATE = "Generate"
-BTN_MY_OFFERS = "My available offers"
-BTN_CREATE_DEEPLINK = "Create deeplink"
-BTN_SETTINGS = "Settings"
-BTN_BACK = "Back"
-BTN_HELP = "Help"
-BTN_DISCONNECT = "Disconnect"
+BTN_CONNECT = "🔗 Connect"
+BTN_GENERATE = "🎬 Generate"
+BTN_MY_OFFERS = "📋 My available offers"
+BTN_CREATE_DEEPLINK = "🌐 Create deeplink"
+BTN_SETTINGS = "⚙️ Settings"
+BTN_BACK = "◀️ Back"
+BTN_HELP = "❓ Help"
+BTN_DISCONNECT = "🔌 Disconnect"
+
+# Plain labels from keyboards cached before emoji restore
+_BTN_ALIASES: dict[str, set[str]] = {
+    BTN_CONNECT: {BTN_CONNECT, "Connect"},
+    BTN_GENERATE: {BTN_GENERATE, "Generate"},
+    BTN_MY_OFFERS: {BTN_MY_OFFERS, "My available offers"},
+    BTN_CREATE_DEEPLINK: {BTN_CREATE_DEEPLINK, "Create deeplink"},
+    BTN_SETTINGS: {BTN_SETTINGS, "Settings"},
+    BTN_BACK: {BTN_BACK, "Back"},
+    BTN_HELP: {BTN_HELP, "Help"},
+    BTN_DISCONNECT: {BTN_DISCONNECT, "Disconnect"},
+}
+
+
+def _btn(label: str):
+    return F.text.in_(_BTN_ALIASES[label])
 
 def connect_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
@@ -118,7 +135,7 @@ def settings_kb() -> ReplyKeyboardMarkup:
 
 def _inline_back_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Main menu", callback_data="main_menu")],
+        [InlineKeyboardButton(text="◀️ Main menu", callback_data="main_menu")],
     ])
 
 
@@ -158,7 +175,7 @@ async def cmd_start(message: Message):
 # ── Connect (2 steps: client_id → client_secret) ──────────────────────────────
 
 @router.message(Command("connect"))
-@router.message(F.text == BTN_CONNECT)
+@router.message(_btn(BTN_CONNECT))
 async def cmd_connect(message: Message, state: FSMContext):
     if await state.get_state() and "ConnectFlow" in str(await state.get_state()):
         return
@@ -239,7 +256,7 @@ async def cmd_disconnect(message: Message):
 
 # ── Main menu ────────────────────────────────────────────────────────────────
 
-@router.message(F.text == BTN_BACK)
+@router.message(_btn(BTN_BACK))
 async def msg_back(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("Choose an action:", reply_markup=await _reply_home_kb(message.from_user.id))
@@ -261,7 +278,7 @@ async def cmd_menu(message: Message):
 
 # ── Settings (Help, Disconnect) ───────────────────────────────────────────────
 
-@router.message(F.text == BTN_SETTINGS)
+@router.message(_btn(BTN_SETTINGS))
 async def msg_settings(message: Message):
     if not await require_auth(message):
         return
@@ -273,7 +290,7 @@ async def msg_settings(message: Message):
     )
 
 
-@router.message(F.text == BTN_HELP)
+@router.message(_btn(BTN_HELP))
 async def msg_help(message: Message):
     if not await require_auth(message):
         return
@@ -293,7 +310,7 @@ async def msg_help(message: Message):
     )
 
 
-@router.message(F.text == BTN_DISCONNECT)
+@router.message(_btn(BTN_DISCONNECT))
 async def msg_disconnect(message: Message):
     if not await require_auth(message):
         return
@@ -319,7 +336,7 @@ async def _start_my_offers(target: Message | CallbackQuery, state: FSMContext):
         await target.answer(text, parse_mode="HTML")
 
 
-@router.message(F.text == BTN_MY_OFFERS)
+@router.message(_btn(BTN_MY_OFFERS))
 async def msg_my_offers(message: Message, state: FSMContext):
     if not await require_auth(message):
         return
@@ -417,7 +434,7 @@ async def cb_show_links(callback: CallbackQuery):
 def _search_back_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Search again", callback_data="search_again")],
-        [InlineKeyboardButton(text="Main menu", callback_data="main_menu")],
+        [InlineKeyboardButton(text="◀️ Main menu", callback_data="main_menu")],
     ])
 
 
@@ -470,7 +487,7 @@ async def _start_create_deeplink(target: Message | CallbackQuery, state: FSMCont
         await target.answer(text, parse_mode="HTML")
 
 
-@router.message(F.text == BTN_CREATE_DEEPLINK)
+@router.message(_btn(BTN_CREATE_DEEPLINK))
 async def msg_create_deeplink(message: Message, state: FSMContext):
     if not await require_auth(message):
         return
@@ -487,7 +504,7 @@ async def cb_dl_search_again(callback: CallbackQuery, state: FSMContext):
 def _deeplink_back_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Search again", callback_data="dl_search_again")],
-        [InlineKeyboardButton(text="Main menu", callback_data="main_menu")],
+        [InlineKeyboardButton(text="◀️ Main menu", callback_data="main_menu")],
     ])
 
 
@@ -673,20 +690,8 @@ def _mode_needs_upload(mode_id: str) -> bool:
     return mode_id in ("i2v", "r2v")
 
 
-async def _ensure_seedance_credits_tracked():
-    if await db.get_seedance_credits() is not None:
-        return
-    if SEEDANCE_INITIAL_CREDITS.isdigit():
-        await db.set_seedance_credits(int(SEEDANCE_INITIAL_CREDITS))
-
-
-async def _resolve_remaining_credits(*, cost: int, final_task: dict) -> int | None:
-    from_api = sd.extract_remaining_credits(final_task)
-    if from_api is not None:
-        await db.set_seedance_credits(from_api)
-        return from_api
-    await _ensure_seedance_credits_tracked()
-    return await db.adjust_seedance_credits(-cost)
+def _format_credits(remaining: int) -> str:
+    return f"Credits remaining: {remaining} / {SEEDANCE_MONTHLY_CREDITS}"
 
 
 async def _begin_data_collection(target: Message, state: FSMContext, mode_id: str):
@@ -710,7 +715,7 @@ async def _begin_data_collection(target: Message, state: FSMContext, mode_id: st
 
 
 @router.message(Command("generate"))
-@router.message(F.text == BTN_GENERATE)
+@router.message(_btn(BTN_GENERATE))
 async def cmd_generate(message: Message, state: FSMContext):
     if message.from_user.id in _active_gen_jobs:
         await message.answer("A generation is already running. Please wait.")
@@ -721,10 +726,17 @@ async def cmd_generate(message: Message, state: FSMContext):
             "Ask the admin to set SEEDANCE_API_KEY in .env"
         )
         return
+    remaining = await db.get_user_credits(message.from_user.id)
+    if remaining <= 0:
+        await message.answer(
+            f"No credits left this month.\n"
+            f"Your allowance resets to {SEEDANCE_MONTHLY_CREDITS} on the 1st (UTC)."
+        )
+        return
     await state.clear()
     await state.set_state(GenerateFlow.choosing_mode)
     await message.answer(
-        format_modes_menu(),
+        f"{format_modes_menu()}\n\n{_format_credits(remaining)}",
         parse_mode="HTML",
         reply_markup=_modes_inline_kb(),
     )
@@ -815,6 +827,7 @@ async def process_gen_text(message: Message, state: FSMContext):
 
 @router.message(GenerateFlow.waiting_data, F.photo)
 async def process_gen_photo(message: Message, state: FSMContext):
+    await _maybe_save_caption_as_prompt(message, state)
     photo = message.photo[-1]
     try:
         path = await _save_telegram_file(message.bot, photo.file_id, ".jpg")
@@ -853,6 +866,7 @@ async def process_gen_document(message: Message, state: FSMContext):
 
 @router.message(GenerateFlow.waiting_data, F.video)
 async def process_gen_video(message: Message, state: FSMContext):
+    await _maybe_save_caption_as_prompt(message, state)
     video = message.video
     try:
         path = await _save_telegram_file(message.bot, video.file_id, ".mp4")
@@ -887,7 +901,14 @@ async def _add_image(message: Message, state: FSMContext, path: str):
         return
     paths.append(path)
     await state.update_data(gen_image_paths=paths)
-    await message.answer(f"Image saved ({len(paths)}). Send more or press Done.")
+    data = await state.get_data()
+    prompt_note = ""
+    if (data.get("gen_prompt") or "").strip():
+        prompt_note = "\nPrompt saved."
+    await message.answer(
+        f"Image saved ({len(paths)}). Send more or press Done.{prompt_note}",
+        reply_markup=_data_kb(show_done=True),
+    )
 
 
 async def _add_video(message: Message, state: FSMContext, path: str):
@@ -943,6 +964,15 @@ async def process_gen_data_fallback(message: Message, state: FSMContext):
         )
 
 
+async def _maybe_save_caption_as_prompt(message: Message, state: FSMContext):
+    caption = (message.caption or "").strip()
+    if not caption:
+        return
+    data = await state.get_data()
+    if not (data.get("gen_prompt") or "").strip():
+        await state.update_data(gen_prompt=caption)
+
+
 async def _start_generation(
     message: Message,
     state: FSMContext,
@@ -955,38 +985,56 @@ async def _start_generation(
     video_paths = list(data.get("gen_video_paths") or [])
     audio_paths = list(data.get("gen_audio_paths") or [])
 
+    mode = get_mode(data.get("gen_mode_id", ""))
+    model = get_model(data.get("gen_model_id", DEFAULT_MODEL_ID))
+    prompt = (data.get("gen_prompt") or "").strip()
+
     if user_id in _active_gen_jobs:
         await message.answer("A generation is already running. Please wait.")
         return
 
-    mode = get_mode(data.get("gen_mode_id", ""))
-    model = get_model(data.get("gen_model_id", DEFAULT_MODEL_ID))
-    prompt = (data.get("gen_prompt") or "").strip()
-    await state.clear()
-
-    if not mode or not model or not prompt:
+    if not mode or not model:
         _cleanup_paths(image_paths, video_paths, audio_paths)
+        await state.clear()
         await message.answer(
             "Session expired. Start again with Generate.",
             reply_markup=await _reply_home_kb(user_id),
         )
         return
 
-    if mode.id == "i2v" and not image_paths:
-        _cleanup_paths(image_paths, video_paths, audio_paths)
+    if not prompt:
         await message.answer(
-            "Image to Video requires a text prompt and at least one image.",
-            reply_markup=await _reply_home_kb(user_id),
+            "Please send a text prompt describing the video, then press Done.",
+            reply_markup=_data_kb(show_done=True),
+        )
+        return
+
+    if mode.id == "i2v" and not image_paths:
+        await message.answer(
+            "Image to Video requires at least one image. Send an image, then press Done.",
+            reply_markup=_data_kb(show_done=True),
         )
         return
 
     if mode.id == "r2v" and not image_paths and not video_paths:
-        _cleanup_paths(image_paths, video_paths, audio_paths)
         await message.answer(
-            "Reference to Video requires a text prompt and at least one image or video.",
+            "Reference to Video requires at least one image or video.",
+            reply_markup=_data_kb(show_done=True),
+        )
+        return
+
+    remaining = await db.get_user_credits(user_id)
+    if remaining <= 0:
+        _cleanup_paths(image_paths, video_paths, audio_paths)
+        await state.clear()
+        await message.answer(
+            f"No credits left this month.\n"
+            f"Your allowance resets to {SEEDANCE_MONTHLY_CREDITS} on the 1st (UTC).",
             reply_markup=await _reply_home_kb(user_id),
         )
         return
+
+    await state.clear()
 
     _active_gen_jobs.add(user_id)
     status_msg = await message.answer("Generation in progress.")
@@ -996,7 +1044,7 @@ async def _start_generation(
         except Exception:
             pass
 
-    asyncio.create_task(
+    task = asyncio.create_task(
         _run_generation(
             bot=message.bot,
             chat_id=message.chat.id,
@@ -1010,6 +1058,8 @@ async def _start_generation(
             audio_paths=audio_paths,
         )
     )
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
 
 
 def _cleanup_paths(
@@ -1057,12 +1107,39 @@ async def _run_generation(
         for path in audio_paths:
             audio_urls.append(await media_upload.upload_file(path))
 
+        status_labels = {
+            "queued": "Queued",
+            "generating": "Generating video",
+            "completed": "Completed",
+            "failed": "Failed",
+        }
+
         async def on_task_created(_task_id: str, cost: int):
+            remaining = await db.get_user_credits(user_id)
+            if cost > remaining:
+                raise sd.SeedanceError(
+                    f"Not enough credits this month (need {cost}, have {remaining})."
+                )
             try:
                 await bot.edit_message_text(
                     chat_id=chat_id,
                     message_id=status_message_id,
-                    text=f"Generation in progress. Cost: {cost} credits.",
+                    text=(
+                        f"Generation started. Cost: {cost} credits.\n"
+                        f"{_format_credits(remaining)}\n"
+                        "Usually takes 3–8 minutes. Please wait."
+                    ),
+                )
+            except Exception:
+                pass
+
+        async def on_status(status: str, _task: dict):
+            label = status_labels.get(status, status or "processing")
+            try:
+                await bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=status_message_id,
+                    text=f"{label}…\nThis may take several minutes.",
                 )
             except Exception:
                 pass
@@ -1075,9 +1152,21 @@ async def _run_generation(
             video_urls=video_urls or None,
             audio_urls=audio_urls or None,
             on_task_created=on_task_created,
+            on_status=on_status,
         )
 
-        async with aiohttp.ClientSession() as session:
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=status_message_id,
+                text="Downloading video…",
+            )
+        except Exception:
+            pass
+
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=300, connect=30, sock_read=240)
+        ) as session:
             async with session.get(result_url) as resp:
                 if resp.status >= 400:
                     await bot.edit_message_text(
@@ -1091,24 +1180,18 @@ async def _run_generation(
         await bot.send_video(
             chat_id,
             video=BufferedInputFile(data, filename="generation.mp4"),
-            caption=f"{mode_label(mode.id)}",
+            caption=f"{mode_label(mode.id)}\n{_format_credits(await db.deduct_user_credits(user_id, task_cost))}",
             reply_markup=home_kb,
         )
-        remaining = await _resolve_remaining_credits(cost=task_cost, final_task=final_task)
-        if remaining is not None:
-            await bot.send_message(
-                chat_id,
-                f"Credits remaining: {remaining}",
-                reply_markup=home_kb,
-            )
+        uploaded_urls = image_urls + video_urls + audio_urls
+        if uploaded_urls:
+            await media_upload.delete_files(uploaded_urls)
         try:
             await bot.delete_message(chat_id=chat_id, message_id=status_message_id)
         except Exception:
             pass
     except (sd.SeedanceError, media_upload.MediaUploadError) as e:
         logger.warning("Seedance job failed: %s", e)
-        if isinstance(e, sd.SeedanceError) and e.available is not None:
-            await db.set_seedance_credits(e.available)
         try:
             await bot.edit_message_text(
                 chat_id=chat_id,

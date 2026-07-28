@@ -21,7 +21,7 @@ CITYADS_API_BASE = "https://cityads.com/api/rest/webmaster"
 # Seedance 2.0 API — https://seedance2.ai/api-docs
 SEEDANCE_API_KEY = os.getenv("SEEDANCE_API_KEY", "").strip()
 SEEDANCE_API_BASE = os.getenv("SEEDANCE_API_BASE", "https://api.seedance2.ai").rstrip("/")
-SEEDANCE_INITIAL_CREDITS = os.getenv("SEEDANCE_INITIAL_CREDITS", "").strip()
+SEEDANCE_MONTHLY_CREDITS = int(os.getenv("SEEDANCE_MONTHLY_CREDITS", "1600"))
 
 # S3-compatible storage for public media URLs (image/reference modes)
 S3_ENDPOINT = os.getenv("S3_ENDPOINT", "").strip()
