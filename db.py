@@ -13,6 +13,12 @@ async def init_db():
                 token_expires_at REAL DEFAULT 0
             )
         """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS bot_kv (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
         await conn.commit()
 
 
@@ -85,3 +91,48 @@ async def is_connected(telegram_id: int) -> bool:
             "SELECT 1 FROM users WHERE telegram_id = ?", (telegram_id,)
         )
         return await cursor.fetchone() is not None
+
+
+async def get_kv(key: str) -> str | None:
+    async with aiosqlite.connect(DB_PATH) as conn:
+        cursor = await conn.execute("SELECT value FROM bot_kv WHERE key = ?", (key,))
+        row = await cursor.fetchone()
+        return row[0] if row else None
+
+
+async def set_kv(key: str, value: str):
+    async with aiosqlite.connect(DB_PATH) as conn:
+        await conn.execute(
+            """
+            INSERT INTO bot_kv (key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (key, value),
+        )
+        await conn.commit()
+
+
+SEEDANCE_CREDITS_KEY = "seedance_credits_available"
+
+
+async def get_seedance_credits() -> int | None:
+    raw = await get_kv(SEEDANCE_CREDITS_KEY)
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+async def set_seedance_credits(amount: int):
+    await set_kv(SEEDANCE_CREDITS_KEY, str(max(0, amount)))
+
+
+async def adjust_seedance_credits(delta: int) -> int | None:
+    current = await get_seedance_credits()
+    if current is None:
+        return None
+    updated = max(0, current + delta)
+    await set_seedance_credits(updated)
+    return updated
