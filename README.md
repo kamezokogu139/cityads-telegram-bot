@@ -29,7 +29,7 @@ SEEDANCE_API_KEY=sk_live_...
 
 3. При первом запуске без `ENCRYPTION_KEY` бот сгенерирует ключ и выведет его в консоль — скопируйте его в `.env`. Этот ключ шифрует API-ключи вебмастеров в БД.
 
-4. Для генерации видео добавьте API-ключ Seedance 2.0 из https://seedance2.ai/api-docs
+4. Для генерации видео добавьте API-ключ Seedance 2.0 из https://seevio.ai
 
 5. Для режимов **Image to Video** и **Reference to Video** настройте S3-совместимое хранилище (Cloudflare R2, AWS S3 и т.д.) — Seedance принимает только публичные URL медиафайлов:
 

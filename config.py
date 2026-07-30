@@ -18,9 +18,9 @@ FERNET = Fernet(_key.encode() if isinstance(_key, str) else _key)
 CITYADS_AUTH_URL = "https://auth2.cityads.com/oauth/access_token"
 CITYADS_API_BASE = "https://cityads.com/api/rest/webmaster"
 
-# Seedance 2.0 API — https://seedance2.ai/api-docs
+# Seedance 2.0 API — https://seevio.ai (migrated from seedance2.ai)
 SEEDANCE_API_KEY = os.getenv("SEEDANCE_API_KEY", "").strip()
-SEEDANCE_API_BASE = os.getenv("SEEDANCE_API_BASE", "https://api.seedance2.ai").rstrip("/")
+SEEDANCE_API_BASE = os.getenv("SEEDANCE_API_BASE", "https://api.seevio.ai").rstrip("/")
 SEEDANCE_MONTHLY_CREDITS = int(os.getenv("SEEDANCE_MONTHLY_CREDITS", "1600"))
 
 # S3-compatible storage for public media URLs (image/reference modes)
