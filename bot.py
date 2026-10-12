@@ -24,6 +24,7 @@ from aiogram.types import (
 import cityads_api as api
 import db
 import media_upload
+import shopee_resolver
 import seedance_api as sd
 from config import BOT_TOKEN, SEEDANCE_MONTHLY_CREDITS, media_upload_configured, seedance_configured
 from seedance_models import (
@@ -513,7 +514,9 @@ async def _dl_set_base_and_ask_url(status_msg: Message, state: FSMContext, base:
     await state.update_data(dl_base_link=base)
     await status_msg.edit_text(
         f"Base link: <code>{base}</code>\n\n"
-        "Now send the <b>target URL</b> for the deeplink.",
+        "Now send the <b>target URL</b> for the deeplink.\n"
+        "<i>Shopee: short links (s.shopee.vn, shp.ee) and share text are OK — "
+        "they will be resolved to the full product URL.</i>",
         parse_mode="HTML",
     )
 
@@ -628,10 +631,29 @@ async def cb_dl_select_offer(callback: CallbackQuery, state: FSMContext):
 
 @router.message(DeeplinkFlow.waiting_url)
 async def process_deeplink_url(message: Message, state: FSMContext):
-    url = (message.text or "").strip()
-    if not url.startswith(("http://", "https://")):
-        await message.answer("Send a valid URL starting with http:// or https://")
-        return
+    raw = (message.text or "").strip()
+    resolved_note = ""
+
+    if shopee_resolver.is_shopee_url(raw):
+        # Shopee: short link / universal-link / share text -> clean product URL
+        status_msg = await message.answer("Resolving Shopee link...")
+        res = await shopee_resolver.resolve_full_link(raw, clean_tracking=True)
+        if res.ok:
+            url = res.full_url
+            resolved_note = f"<b>Resolved Shopee link:</b>\n<code>{url}</code>\n\n"
+        else:
+            # Fallback: keep the original URL so the webmaster still gets a link
+            url = shopee_resolver.extract_url(raw) or raw
+            resolved_note = (
+                f"⚠️ Could not resolve Shopee link ({res.error}). "
+                f"Using original URL.\n\n"
+            )
+        await status_msg.delete()
+    else:
+        url = raw
+        if not url.startswith(("http://", "https://")):
+            await message.answer("Send a valid URL starting with http:// or https://")
+            return
 
     data = await state.get_data()
     base = data.get("dl_base_link", "")
@@ -649,7 +671,7 @@ async def process_deeplink_url(message: Message, state: FSMContext):
         logger.exception("shorten_link error: %s", e)
         result = deeplink
     await message.answer(
-        f"<b>Your deeplink:</b>\n\n<code>{result}</code>",
+        f"{resolved_note}<b>Your deeplink:</b>\n\n<code>{result}</code>",
         parse_mode="HTML",
         reply_markup=main_menu_kb(),
     )

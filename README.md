@@ -55,12 +55,14 @@ python bot.py
 2. Отправьте `/connect`.
 3. Введите `client_id` и `client_secret` из https://cityads.com/publisher/api
 4. Готово — бот зашифрует ключи, удалит ваши сообщения из чата и будет автоматически обновлять access_token.
+5. **Create deeplink** → выберите оффер → отправьте ссылку на товар. Для Shopee (все страны) можно вставлять короткие ссылки (`s.shopee.vn`, `shp.ee`, `shope.ee`), universal-link или текст из кнопки «Поделиться» — бот сам развернёт их в полную ссылку товара и уберёт чужие трекинг-параметры (`utm_*`, `aff_sid` и т.д.).
 
 ## Структура
 
 ```
 ├── bot.py            — Telegram-бот (aiogram 3)
 ├── cityads_api.py    — Работа с CityAds API + авто-обновление токена
+├── shopee_resolver.py — Разворачивание коротких/universal ссылок Shopee в полный URL товара
 ├── seedance_api.py   — Генерация видео через Seedance 2.0 API
 ├── seedance_models.py — Режимы и модели Seedance
 ├── media_upload.py   — Загрузка медиа в S3 для публичных URL
