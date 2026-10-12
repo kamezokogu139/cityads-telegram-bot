@@ -5,12 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-ModeId = Literal["t2v", "i2v", "r2v"]
+ModeId = Literal["t2v", "i2v", "r2v", "scenario"]
 
 MODE_ORDER: list[tuple[ModeId, str]] = [
     ("t2v", "Text to Video"),
     ("i2v", "Image to Video"),
     ("r2v", "Reference to Video"),
+    ("scenario", "Scenario → video"),
 ]
 
 
@@ -51,6 +52,11 @@ MODES: dict[ModeId, ModeSpec] = {
         max_videos=3,
         allows_audio=True,
         max_audios=3,
+    ),
+    "scenario": ModeSpec(
+        id="scenario",
+        title="Scenario → video",
+        generation_type="scenario-to-video",
     ),
 }
 
@@ -137,6 +143,18 @@ def format_mode_instructions(mode_id: ModeId) -> str:
             "Send a text prompt and 1 image (or 2 images for first and last frame).\n"
             "You can send them in any order. Press Done when ready."
         )
+    if mode_id == "scenario":
+        return (
+            "<b>Scenario → video</b>\n\n"
+            "Send text, an image, or an image with a caption.\n"
+            "I'll enhance the prompt with AI. If you send a photo, the prompt and the "
+            "picture complement each other: identity and scene stay from the photo, "
+            "action and intent come from your text.\n"
+            "If anyone speaks a line — in quotes or after says:/говорит: — "
+            "that person talks on camera with lip-sync.\n\n"
+            "Example: a host shows white sneakers and says: "
+            "\"Look how comfortable this sole is.\""
+        )
     return (
         "<b>Reference to Video</b>\n\n"
         "Send a text prompt and at least one reference image or video.\n"
@@ -152,6 +170,7 @@ def format_modes_menu() -> str:
         "1. Text to Video",
         "2. Image to Video",
         "3. Reference to Video",
+        "4. Scenario → video",
     ]
     return "\n".join(lines)
 
@@ -186,6 +205,14 @@ def parse_mode_choice(text: str) -> ModeId | None:
         "reference to video": "r2v",
         "r2v": "r2v",
         "reference-to-video": "r2v",
+        "scenario": "scenario",
+        "scenario -> video": "scenario",
+        "scenario → video": "scenario",
+        "scenario -> refs -> video": "scenario",
+        "scenario → refs → video": "scenario",
+        "сценарий": "scenario",
+        "сценарий → видео": "scenario",
+        "сценарий → референсы → видео": "scenario",
     }
     return aliases.get(lower)  # type: ignore[return-value]
 

@@ -37,3 +37,27 @@ def seedance_configured() -> bool:
 
 def media_upload_configured() -> bool:
     return bool(S3_BUCKET and S3_ACCESS_KEY and S3_SECRET_KEY and S3_PUBLIC_BASE_URL)
+
+
+# Video backend
+# - "seedance": текущая логика (SEEDANCE_API_KEY + кредиты)
+# - "comfy": локальный worker на ноуте (VPS только шлёт job и получает result_url)
+VIDEO_BACKEND = os.getenv("VIDEO_BACKEND", "seedance").strip().lower()
+
+# Local ComfyUI worker (Windows ноутбук), который генерит видео и загружает результат в R2
+COMFY_WORKER_BASE_URL = os.getenv("COMFY_WORKER_BASE_URL", "").strip().rstrip("/")
+COMFY_WORKER_API_TOKEN = os.getenv("COMFY_WORKER_API_TOKEN", "").strip()
+COMFY_WORKER_JOB_POLL_INTERVAL_SEC = float(
+    os.getenv("COMFY_WORKER_JOB_POLL_INTERVAL_SEC", "3")
+)
+COMFY_WORKER_JOB_TIMEOUT_SEC = float(
+    os.getenv("COMFY_WORKER_JOB_TIMEOUT_SEC", "1800")
+)
+
+# Сколько "кредитов" снимать с пользователя за генерацию при VIDEO_BACKEND=comfy.
+# 0 сделает генерацию "бесплатной" с точки зрения бота (но лучше ограничивать от спама).
+COMFY_WORKER_TASK_CREDITS_COST = int(os.getenv("COMFY_WORKER_TASK_CREDITS_COST", "1"))
+
+
+def comfy_worker_configured() -> bool:
+    return bool(COMFY_WORKER_BASE_URL and COMFY_WORKER_API_TOKEN)

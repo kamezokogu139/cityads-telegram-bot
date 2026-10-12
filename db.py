@@ -1,4 +1,5 @@
 import aiosqlite
+import time
 from datetime import datetime, timezone
 
 from config import DB_PATH, FERNET, SEEDANCE_MONTHLY_CREDITS
@@ -15,6 +16,26 @@ async def init_db():
                 token_expires_at REAL DEFAULT 0
             )
         """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS jobs (
+                job_id        TEXT PRIMARY KEY,
+                status        TEXT NOT NULL,
+                mode_id       TEXT NOT NULL,
+                prompt        TEXT NOT NULL,
+                image_url     TEXT,
+                width         INTEGER,
+                height        INTEGER,
+                aspect_ratio  TEXT,
+                megapixels    REAL,
+                result_url    TEXT,
+                error         TEXT,
+                chat_id       INTEGER NOT NULL,
+                created_at    REAL NOT NULL,
+                updated_at    REAL NOT NULL,
+                locked_until  REAL NOT NULL DEFAULT 0
+            )
+        """)
+        await _ensure_jobs_columns(conn)
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS bot_kv (
                 key   TEXT PRIMARY KEY,
@@ -176,3 +197,135 @@ async def adjust_seedance_credits(delta: int) -> int | None:
     updated = max(0, current + delta)
     await set_seedance_credits(updated)
     return updated
+
+
+async def _ensure_jobs_columns(conn: aiosqlite.Connection) -> None:
+    cursor = await conn.execute("PRAGMA table_info(jobs)")
+    rows = await cursor.fetchall()
+    cols = {row[1] for row in rows}
+    if "width" not in cols:
+        await conn.execute("ALTER TABLE jobs ADD COLUMN width INTEGER")
+    if "height" not in cols:
+        await conn.execute("ALTER TABLE jobs ADD COLUMN height INTEGER")
+    if "aspect_ratio" not in cols:
+        await conn.execute("ALTER TABLE jobs ADD COLUMN aspect_ratio TEXT")
+    if "megapixels" not in cols:
+        await conn.execute("ALTER TABLE jobs ADD COLUMN megapixels REAL")
+    if "duration_sec" not in cols:
+        await conn.execute("ALTER TABLE jobs ADD COLUMN duration_sec INTEGER")
+
+
+async def create_job(
+    *,
+    job_id: str,
+    status: str,
+    mode_id: str,
+    prompt: str,
+    image_url: str | None,
+    chat_id: int,
+    aspect_ratio: str | None = None,
+    megapixels: float | None = None,
+    locked_until: float = 0,
+    duration_sec: int | None = None,
+) -> None:
+    now = time.time()
+    async with aiosqlite.connect(DB_PATH) as conn:
+        await conn.execute(
+            """
+            INSERT INTO jobs (
+                job_id, status, mode_id, prompt, image_url,
+                aspect_ratio, megapixels, result_url, error,
+                chat_id, created_at, updated_at, locked_until, duration_sec
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?)
+            """,
+            (
+                job_id, status, mode_id, prompt, image_url,
+                aspect_ratio, megapixels,
+                chat_id, now, now, locked_until, duration_sec,
+            ),
+        )
+        await conn.commit()
+
+
+async def claim_next_job(*, lock_seconds: int) -> dict | None:
+    now = time.time()
+    locked_until = now + lock_seconds
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        # SQLite: BEGIN IMMEDIATE makes selection+claim atomic.
+        await conn.execute("BEGIN IMMEDIATE")
+        row = await (await conn.execute(
+            """
+            SELECT job_id, status, mode_id, prompt, image_url, aspect_ratio, megapixels, duration_sec, chat_id
+            FROM jobs
+            WHERE status = 'queued'
+               OR (status = 'running' AND locked_until < ?)
+            ORDER BY created_at ASC
+            LIMIT 1
+            """,
+            (now,),
+        )).fetchone()
+
+        if not row:
+            await conn.execute("COMMIT")
+            return None
+
+        job_id = row["job_id"]
+        await conn.execute(
+            """
+            UPDATE jobs
+            SET status='running', updated_at=?, locked_until=?
+            WHERE job_id=? AND (status='queued' OR locked_until < ?)
+            """,
+            (now, locked_until, job_id, now),
+        )
+        await conn.execute("COMMIT")
+        return dict(row)
+
+
+async def get_job(job_id: str) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        row = await (await conn.execute(
+            """
+            SELECT
+                job_id, status, mode_id, prompt, image_url,
+                aspect_ratio, megapixels, duration_sec, result_url, error,
+                chat_id, created_at, updated_at, locked_until
+            FROM jobs
+            WHERE job_id = ?
+            """,
+            (job_id,),
+        )).fetchone()
+        return dict(row) if row else None
+
+
+async def set_job_status(
+    *,
+    job_id: str,
+    status: str,
+    result_url: str | None = None,
+    error: str | None = None,
+) -> None:
+    now = time.time()
+    async with aiosqlite.connect(DB_PATH) as conn:
+        await conn.execute(
+            """
+            UPDATE jobs
+            SET
+                status=?,
+                result_url=?,
+                error=?,
+                updated_at=?,
+                locked_until=0
+            WHERE job_id=?
+            """,
+            (status, result_url, error, now, job_id),
+        )
+        await conn.commit()
+
+
+async def delete_job(job_id: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as conn:
+        await conn.execute("DELETE FROM jobs WHERE job_id=?", (job_id,))
+        await conn.commit()

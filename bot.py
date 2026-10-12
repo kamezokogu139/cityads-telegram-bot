@@ -3,6 +3,7 @@ import logging
 import os
 import tempfile
 import time
+import uuid
 from pathlib import Path
 
 import aiohttp
@@ -11,6 +12,8 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
+    BotCommand,
+    BotCommandScopeDefault,
     BufferedInputFile,
     CallbackQuery,
     InlineKeyboardButton,
@@ -26,7 +29,18 @@ import db
 import media_upload
 import shopee_resolver
 import seedance_api as sd
-from config import BOT_TOKEN, SEEDANCE_MONTHLY_CREDITS, media_upload_configured, seedance_configured
+import comfy_worker_api as cw
+from config import (
+    BOT_TOKEN,
+    SEEDANCE_MONTHLY_CREDITS,
+    VIDEO_BACKEND,
+    COMFY_WORKER_TASK_CREDITS_COST,
+    COMFY_WORKER_JOB_POLL_INTERVAL_SEC,
+    COMFY_WORKER_JOB_TIMEOUT_SEC,
+    comfy_worker_configured,
+    media_upload_configured,
+    seedance_configured,
+)
 from seedance_models import (
     DEFAULT_MODEL_ID,
     MODE_ORDER,
@@ -37,6 +51,7 @@ from seedance_models import (
     mode_label,
     parse_mode_choice,
 )
+import scenario_flow
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -68,6 +83,31 @@ class DeeplinkFlow(StatesGroup):
 class GenerateFlow(StatesGroup):
     choosing_mode = State()
     waiting_data = State()
+    choosing_video_settings = State()
+
+
+VIDEO_QUALITY_PRESETS: dict[str, float] = {
+    "fast": 0.5,
+    "standard": 1.0,
+    "hd": 1.8,
+}
+
+VIDEO_ASPECT_CHOICES: dict[str, str] = {
+    "16:9": "16:9 (Widescreen)",
+    "9:16": "9:16 (Portrait Widescreen)",
+    "1:1": "1:1 (Square)",
+    "4:3": "4:3 (Standard)",
+    "3:4": "3:4 (Portrait Standard)",
+}
+_ASPECT_CALLBACK_PREFIX = "gen:aspect:"
+
+
+def parse_aspect_callback(data: str) -> str | None:
+    # ponytail: callback is gen:aspect:16:9 — rsplit(":") would keep only "9"
+    if not (data or "").startswith(_ASPECT_CALLBACK_PREFIX):
+        return None
+    key = data[len(_ASPECT_CALLBACK_PREFIX):]
+    return key if key in VIDEO_ASPECT_CHOICES else None
 
 
 # ── Keyboards ────────────────────────────────────────────────────────────────
@@ -303,7 +343,8 @@ async def msg_help(message: Message):
         "/disconnect — Unlink CityAds account and delete data\n"
         "/help — This help\n\n"
         "<b>Main menu:</b>\n"
-        "• Generate — video via Seedance 2.0\n"
+        "• Generate — video via Seedance 2.0 / Comfy\n"
+        "• Scenario → video — text and/or photo, then LTX video\n"
         "• My available offers — search by ID or name, get tracking links\n"
         "• Create deeplink — search offer, enter target URL, get deeplink",
         parse_mode="HTML",
@@ -708,6 +749,32 @@ def _data_kb(*, show_done: bool) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def _video_quality_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="⚡ Fast", callback_data="gen:quality:fast"),
+            InlineKeyboardButton(text="✅ Standard", callback_data="gen:quality:standard"),
+            InlineKeyboardButton(text="🎬 HD", callback_data="gen:quality:hd"),
+        ],
+        [InlineKeyboardButton(text="Cancel", callback_data="gen:cancel")],
+    ])
+
+
+def _video_aspect_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="16:9", callback_data=f"{_ASPECT_CALLBACK_PREFIX}16:9"),
+            InlineKeyboardButton(text="9:16", callback_data=f"{_ASPECT_CALLBACK_PREFIX}9:16"),
+            InlineKeyboardButton(text="1:1", callback_data=f"{_ASPECT_CALLBACK_PREFIX}1:1"),
+        ],
+        [
+            InlineKeyboardButton(text="4:3", callback_data=f"{_ASPECT_CALLBACK_PREFIX}4:3"),
+            InlineKeyboardButton(text="3:4", callback_data=f"{_ASPECT_CALLBACK_PREFIX}3:4"),
+        ],
+        [InlineKeyboardButton(text="Cancel", callback_data="gen:cancel")],
+    ])
+
+
 def _mode_needs_upload(mode_id: str) -> bool:
     return mode_id in ("i2v", "r2v")
 
@@ -716,7 +783,11 @@ def _format_credits(remaining: int) -> str:
     return f"Credits remaining: {remaining} / {SEEDANCE_MONTHLY_CREDITS}"
 
 
-async def _begin_data_collection(target: Message, state: FSMContext, mode_id: str):
+async def _begin_data_collection(target: Message, state: FSMContext, mode_id: str, user_id: int | None = None):
+    if mode_id == "scenario":
+        uid = user_id or (target.from_user.id if target.from_user else target.chat.id)
+        await scenario_flow.begin_scenario(target, state, uid)
+        return
     mode = get_mode(mode_id)
     if not mode:
         return
@@ -742,19 +813,43 @@ async def cmd_generate(message: Message, state: FSMContext):
     if message.from_user.id in _active_gen_jobs:
         await message.answer("A generation is already running. Please wait.")
         return
-    if not seedance_configured():
-        await message.answer(
-            "Seedance API is not configured on the server.\n"
-            "Ask the admin to set SEEDANCE_API_KEY in .env"
-        )
+    if VIDEO_BACKEND == "seedance":
+        if not seedance_configured():
+            await message.answer(
+                "Seedance API is not configured on the server.\n"
+                "Ask the admin to set SEEDANCE_API_KEY in .env"
+            )
+            return
+    elif VIDEO_BACKEND == "comfy":
+        if not comfy_worker_configured():
+            await message.answer(
+                "ComfyUI worker is not configured.\n"
+                "Ask the admin to set COMFY_WORKER_BASE_URL and COMFY_WORKER_API_TOKEN in .env"
+            )
+            return
+    elif VIDEO_BACKEND == "comfy_poll":
+        # Polling backend: бот создаёт job в БД на VPS, а Windows worker
+        # периодически забирает job и выкладывает результат обратно.
+        pass
+    else:
+        await message.answer(f"Unknown VIDEO_BACKEND: {VIDEO_BACKEND}")
         return
     remaining = await db.get_user_credits(message.from_user.id)
-    if remaining <= 0:
-        await message.answer(
-            f"No credits left this month.\n"
-            f"Your allowance resets to {SEEDANCE_MONTHLY_CREDITS} on the 1st (UTC)."
-        )
-        return
+    if VIDEO_BACKEND == "seedance":
+        if remaining <= 0:
+            await message.answer(
+                f"No credits left this month.\n"
+                f"Your allowance resets to {SEEDANCE_MONTHLY_CREDITS} on the 1st (UTC)."
+            )
+            return
+    else:
+        if COMFY_WORKER_TASK_CREDITS_COST > 0 and remaining < COMFY_WORKER_TASK_CREDITS_COST:
+            await message.answer(
+                "Not enough credits to start generation (comfy backend).\n"
+                f"Need {COMFY_WORKER_TASK_CREDITS_COST}, have {remaining}.\n"
+                f"Allowance resets to {SEEDANCE_MONTHLY_CREDITS} on the 1st (UTC)."
+            )
+            return
     await state.clear()
     await state.set_state(GenerateFlow.choosing_mode)
     await message.answer(
@@ -767,6 +862,7 @@ async def cmd_generate(message: Message, state: FSMContext):
 @router.callback_query(F.data == "gen:cancel")
 async def cb_gen_cancel(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
+    _active_gen_jobs.discard(callback.from_user.id)
     await state.clear()
     kb = await _reply_home_kb(callback.from_user.id)
     try:
@@ -781,7 +877,7 @@ async def process_gen_mode_text(message: Message, state: FSMContext):
     mode = parse_mode_choice(message.text or "")
     if not mode:
         await message.answer(
-            "Send a mode number (1-3).\n\n" + format_modes_menu(),
+            "Send a mode number (1-4).\n\n" + format_modes_menu(),
             parse_mode="HTML",
             reply_markup=_modes_inline_kb(),
         )
@@ -795,7 +891,7 @@ async def process_gen_mode_text(message: Message, state: FSMContext):
             reply_markup=_modes_inline_kb(),
         )
         return
-    await _begin_data_collection(message, state, mode)
+    await _begin_data_collection(message, state, mode, user_id=message.from_user.id)
 
 
 @router.callback_query(GenerateFlow.choosing_mode, F.data.startswith("gen:mode:"))
@@ -815,7 +911,9 @@ async def cb_gen_mode(callback: CallbackQuery, state: FSMContext):
         await callback.message.edit_reply_markup(reply_markup=None)
     except Exception:
         pass
-    await _begin_data_collection(callback.message, state, mode_id)
+    await _begin_data_collection(
+        callback.message, state, mode_id, user_id=callback.from_user.id
+    )
 
 
 async def _save_telegram_file(bot: Bot, file_id: str, suffix: str) -> str:
@@ -970,6 +1068,41 @@ async def _add_audio(message: Message, state: FSMContext, path: str):
 @router.callback_query(GenerateFlow.waiting_data, F.data == "gen:done")
 async def cb_gen_done(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
+    if VIDEO_BACKEND == "comfy_poll":
+        await state.set_state(GenerateFlow.choosing_video_settings)
+        await callback.message.answer(
+            "Choose quality:\n"
+            "⚡ Fast — 0.5 MP\n"
+            "✅ Standard — 1.0 MP\n"
+            "🎬 HD — 1.8 MP",
+            reply_markup=_video_quality_kb(),
+        )
+        return
+    await _start_generation(callback.message, state, from_callback=True)
+
+
+@router.callback_query(GenerateFlow.choosing_video_settings, F.data.startswith("gen:quality:"))
+async def cb_gen_quality(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    quality = callback.data.rsplit(":", 1)[-1]
+    if quality not in VIDEO_QUALITY_PRESETS:
+        await callback.message.answer("Unknown quality preset.", reply_markup=_video_quality_kb())
+        return
+    await state.update_data(gen_quality=quality)
+    await callback.message.answer(
+        "Choose aspect ratio:",
+        reply_markup=_video_aspect_kb(),
+    )
+
+
+@router.callback_query(GenerateFlow.choosing_video_settings, F.data.startswith(_ASPECT_CALLBACK_PREFIX))
+async def cb_gen_aspect(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    aspect_key = parse_aspect_callback(callback.data or "")
+    if not aspect_key:
+        await callback.message.answer("Unknown aspect ratio.", reply_markup=_video_aspect_kb())
+        return
+    await state.update_data(gen_aspect_key=aspect_key)
     await _start_generation(callback.message, state, from_callback=True)
 
 
@@ -1038,25 +1171,58 @@ async def _start_generation(
         )
         return
 
-    if mode.id == "r2v" and not image_paths and not video_paths:
-        await message.answer(
-            "Reference to Video requires at least one image or video.",
-            reply_markup=_data_kb(show_done=True),
-        )
-        return
+    if mode.id == "r2v":
+        if VIDEO_BACKEND in ("comfy", "comfy_poll"):
+            if not image_paths:
+                await message.answer(
+                    "Reference to Video (comfy backend) requires at least one image.",
+                    reply_markup=_data_kb(show_done=True),
+                )
+                return
+        elif not image_paths and not video_paths:
+            await message.answer(
+                "Reference to Video requires at least one image or video.",
+                reply_markup=_data_kb(show_done=True),
+            )
+            return
 
     remaining = await db.get_user_credits(user_id)
-    if remaining <= 0:
-        _cleanup_paths(image_paths, video_paths, audio_paths)
-        await state.clear()
-        await message.answer(
-            f"No credits left this month.\n"
-            f"Your allowance resets to {SEEDANCE_MONTHLY_CREDITS} on the 1st (UTC).",
-            reply_markup=await _reply_home_kb(user_id),
-        )
-        return
+    # Seedance backend requires credits gating. For the comfy backend we can
+    # optionally charge a small fixed amount to prevent spam.
+    if VIDEO_BACKEND == "seedance":
+        if remaining <= 0:
+            _cleanup_paths(image_paths, video_paths, audio_paths)
+            await state.clear()
+            await message.answer(
+                f"No credits left this month.\n"
+                f"Your allowance resets to {SEEDANCE_MONTHLY_CREDITS} on the 1st (UTC).",
+                reply_markup=await _reply_home_kb(user_id),
+            )
+            return
+    else:
+        if remaining < COMFY_WORKER_TASK_CREDITS_COST:
+            _cleanup_paths(image_paths, video_paths, audio_paths)
+            await state.clear()
+            await message.answer(
+                "Not enough credits to start generation.\n"
+                f"Need {COMFY_WORKER_TASK_CREDITS_COST}, have {remaining}.\n"
+                f"Allowance resets to {SEEDANCE_MONTHLY_CREDITS} on the 1st (UTC).",
+                reply_markup=await _reply_home_kb(user_id),
+            )
+            return
 
     await state.clear()
+
+    video_aspect_ratio: str | None = None
+    video_megapixels: float | None = None
+    if VIDEO_BACKEND == "comfy_poll":
+        quality = str(data.get("gen_quality") or "standard")
+        aspect_key = str(data.get("gen_aspect_key") or "16:9")
+        video_megapixels = VIDEO_QUALITY_PRESETS.get(quality, 1.0)
+        video_aspect_ratio = VIDEO_ASPECT_CHOICES.get(
+            aspect_key,
+            VIDEO_ASPECT_CHOICES["16:9"],
+        )
 
     _active_gen_jobs.add(user_id)
     status_msg = await message.answer("Generation in progress.")
@@ -1078,6 +1244,8 @@ async def _start_generation(
             image_paths=image_paths,
             video_paths=video_paths,
             audio_paths=audio_paths,
+            aspect_ratio=video_aspect_ratio,
+            megapixels=video_megapixels,
         )
     )
     _bg_tasks.add(task)
@@ -1109,10 +1277,13 @@ async def _run_generation(
     image_paths: list[str],
     video_paths: list[str],
     audio_paths: list[str],
+    aspect_ratio: str | None = None,
+    megapixels: float | None = None,
 ):
     mode = get_mode(mode_id)
     model = get_model(model_id)
     home_kb = await _reply_home_kb(user_id)
+    poll_job_id: str | None = None
     try:
         if not mode or not model:
             raise sd.SeedanceError("Unknown mode or model.")
@@ -1121,13 +1292,15 @@ async def _run_generation(
         for path in image_paths:
             image_urls.append(await media_upload.upload_file(path))
 
+        # Seedance использует видео/аудио, а comfy/comfy_poll пока только стартовую картинку
+        # (для i2v/r2v) или промпт (для t2v).
         video_urls: list[str] = []
-        for path in video_paths:
-            video_urls.append(await media_upload.upload_file(path))
-
         audio_urls: list[str] = []
-        for path in audio_paths:
-            audio_urls.append(await media_upload.upload_file(path))
+        if VIDEO_BACKEND == "seedance":
+            for path in video_paths:
+                video_urls.append(await media_upload.upload_file(path))
+            for path in audio_paths:
+                audio_urls.append(await media_upload.upload_file(path))
 
         status_labels = {
             "queued": "Queued",
@@ -1142,6 +1315,11 @@ async def _run_generation(
                 raise sd.SeedanceError(
                     f"Not enough credits this month (need {cost}, have {remaining})."
                 )
+            wait_msg = (
+                "Usually takes 3–8 minutes. Please wait."
+                if VIDEO_BACKEND == "seedance"
+                else "Local generation can take several minutes. Please wait."
+            )
             try:
                 await bot.edit_message_text(
                     chat_id=chat_id,
@@ -1149,7 +1327,7 @@ async def _run_generation(
                     text=(
                         f"Generation started. Cost: {cost} credits.\n"
                         f"{_format_credits(remaining)}\n"
-                        "Usually takes 3–8 minutes. Please wait."
+                        + wait_msg
                     ),
                 )
             except Exception:
@@ -1166,16 +1344,88 @@ async def _run_generation(
             except Exception:
                 pass
 
-        result_url, task_cost, final_task = await sd.generate_video(
-            mode,
-            model,
-            prompt,
-            image_urls=image_urls or None,
-            video_urls=video_urls or None,
-            audio_urls=audio_urls or None,
-            on_task_created=on_task_created,
-            on_status=on_status,
-        )
+        if VIDEO_BACKEND == "seedance":
+            result_url, task_cost, final_task = await sd.generate_video(
+                mode,
+                model,
+                prompt,
+                image_urls=image_urls or None,
+                video_urls=video_urls or None,
+                audio_urls=audio_urls or None,
+                on_task_created=on_task_created,
+                on_status=on_status,
+            )
+        elif VIDEO_BACKEND == "comfy":
+            # For the first iteration we only support:
+            # - t2v: prompt only
+            # - i2v/r2v: use the first image as the start frame
+            result_url, task_cost, final_task = await cw.generate_video(
+                mode,
+                prompt,
+                image_urls=image_urls or None,
+                on_task_created=on_task_created,
+                on_status=on_status,
+            )
+        elif VIDEO_BACKEND == "comfy_poll":
+            # Бот создаёт job в БД, Windows worker забирает job и обновляет статус.
+            worker_mode_id = "t2v" if mode.id == "t2v" else "i2v"
+            image_url_for_worker = image_urls[0] if worker_mode_id != "t2v" else None
+            if worker_mode_id != "t2v" and not image_url_for_worker:
+                raise cw.ComfyWorkerError("comfy_poll: missing image_url for i2v/r2v.")
+
+            poll_job_id = uuid.uuid4().hex
+            task_cost = COMFY_WORKER_TASK_CREDITS_COST
+
+            await db.create_job(
+                job_id=poll_job_id,
+                status="queued",
+                mode_id=worker_mode_id,
+                prompt=prompt,
+                image_url=image_url_for_worker,
+                chat_id=chat_id,
+                locked_until=0,
+                aspect_ratio=aspect_ratio,
+                megapixels=megapixels,
+                duration_sec=None,
+            )
+
+            # Стартовое сообщение (как у других бэкендов)
+            await on_task_created(poll_job_id, task_cost)
+
+            started_at = time.time()
+            job_timeout = COMFY_WORKER_JOB_TIMEOUT_SEC
+            poll_interval = COMFY_WORKER_JOB_POLL_INTERVAL_SEC
+            last_status: str | None = None
+
+            while True:
+                if time.time() - started_at > job_timeout:
+                    raise cw.ComfyWorkerError(
+                        f"comfy_poll timeout after {int(job_timeout)}s."
+                    )
+
+                job = await db.get_job(poll_job_id)
+                if not job:
+                    raise cw.ComfyWorkerError("comfy_poll: job disappeared.")
+
+                status = str(job.get("status") or "")
+                if status != last_status:
+                    await on_status(status, job)
+                    last_status = status
+
+                if status == "completed":
+                    result_url = job.get("result_url")
+                    if not isinstance(result_url, str) or not result_url:
+                        raise cw.ComfyWorkerError("comfy_poll: completed but missing result_url.")
+                    final_task = job
+                    break
+
+                if status == "failed":
+                    err = job.get("error") or "Unknown worker error"
+                    raise cw.ComfyWorkerError(str(err))
+
+                await asyncio.sleep(poll_interval)
+        else:
+            raise sd.SeedanceError(f"Unknown VIDEO_BACKEND: {VIDEO_BACKEND}")
 
         try:
             await bot.edit_message_text(
@@ -1205,6 +1455,11 @@ async def _run_generation(
             caption=f"{mode_label(mode.id)}\n{_format_credits(await db.deduct_user_credits(user_id, task_cost))}",
             reply_markup=home_kb,
         )
+        if poll_job_id and VIDEO_BACKEND == "comfy_poll":
+            try:
+                await db.delete_job(poll_job_id)
+            except Exception:
+                pass
         uploaded_urls = image_urls + video_urls + audio_urls
         if uploaded_urls:
             await media_upload.delete_files(uploaded_urls)
@@ -1212,7 +1467,7 @@ async def _run_generation(
             await bot.delete_message(chat_id=chat_id, message_id=status_message_id)
         except Exception:
             pass
-    except (sd.SeedanceError, media_upload.MediaUploadError) as e:
+    except (sd.SeedanceError, cw.ComfyWorkerError, media_upload.MediaUploadError) as e:
         logger.warning("Seedance job failed: %s", e)
         try:
             await bot.edit_message_text(
@@ -1238,6 +1493,11 @@ async def _run_generation(
             await bot.send_message(chat_id, "Choose an action:", reply_markup=home_kb)
     finally:
         _active_gen_jobs.discard(user_id)
+        if poll_job_id and VIDEO_BACKEND == "comfy_poll":
+            try:
+                await db.delete_job(poll_job_id)
+            except Exception:
+                pass
         _cleanup_paths(image_paths, video_paths, audio_paths)
 
 
@@ -1249,13 +1509,13 @@ async def cmd_help(message: Message):
         "<b>Commands:</b>\n\n"
         "/start — Get started\n"
         "/connect — Connect CityAds (client_id + client_secret)\n"
-        "/generate — Generate video (Seedance 2.0)\n"
+        f"/generate — Generate video ({VIDEO_BACKEND})\n"
         "/disconnect — Disconnect & delete data\n"
         "/menu — Main menu\n"
         "/help — This help\n\n"
         "<b>How it works:</b>\n"
         "1. /connect — enter client_id + client_secret (OAuth 2.0)\n"
-        "2. Generate — Seedance 2.0 video (text/image/reference)\n"
+        f"2. Generate — video via backend ({VIDEO_BACKEND}) (text / image / scenario)\n"
         "3. My offers — search by ID or name, get tracking links\n"
         "4. Create deeplink — search by ID or name, then enter target URL",
         parse_mode="HTML",
@@ -1264,10 +1524,26 @@ async def cmd_help(message: Message):
 
 # ── Entry point ──────────────────────────────────────────────────────────────
 
+BOT_COMMANDS = [
+    BotCommand(command="start", description="Get started"),
+    BotCommand(command="menu", description="Open main menu"),
+    BotCommand(command="generate", description="Generate video: text, image, or scenario"),
+    BotCommand(command="connect", description="Connect CityAds account"),
+    BotCommand(command="disconnect", description="Unlink CityAds account"),
+    BotCommand(command="help", description="Show help"),
+]
+
+
 async def main():
     await db.init_db()
     bot = Bot(token=BOT_TOKEN)
+    try:
+        await bot.delete_my_commands(scope=BotCommandScopeDefault(), language_code="ru")
+    except Exception:
+        logger.exception("Failed to clear Russian bot commands")
+    await bot.set_my_commands(BOT_COMMANDS, scope=BotCommandScopeDefault())
     dp = Dispatcher()
+    dp.include_router(scenario_flow.router)
     dp.include_router(router)
     logger.info("Bot started")
     await dp.start_polling(bot)
