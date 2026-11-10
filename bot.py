@@ -556,7 +556,7 @@ async def _dl_set_base_and_ask_url(status_msg: Message, state: FSMContext, base:
     await status_msg.edit_text(
         f"Base link: <code>{base}</code>\n\n"
         "Now send the <b>target URL</b> for the deeplink.\n"
-        "<i>Shopee: short links (s.shopee.vn, shp.ee) and share text are OK — "
+        "<i>Shopee: short links (s.shopee.vn, shp.ee, vn.shp.ee) and share text are OK — "
         "they will be resolved to the full product URL.</i>",
         parse_mode="HTML",
     )

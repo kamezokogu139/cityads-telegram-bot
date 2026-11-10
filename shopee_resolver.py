@@ -33,8 +33,10 @@ _SHOPEE_HOST_RE = re.compile(
 _SHOPEE_MAIN_HOST_RE = re.compile(
     r"^(?:www\.)?shopee\.(?:" + "|".join(_SHOPEE_TLDS) + r")$", re.IGNORECASE
 )
-# Global short-link domains that are not under shopee.<tld>
-_SHOPEE_SHORT_HOSTS = {"shp.ee", "shope.ee"}
+# Short-link domains: shp.ee / shope.ee and regional prefixes (vn.shp.ee, id.shp.ee, …)
+_SHOPEE_SHORT_HOST_RE = re.compile(
+    r"^(?:[\w-]+\.)?(?:shp|shope)\.ee$", re.IGNORECASE
+)
 
 TRACKING_PARAMS = {
     "d_id", "utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term",
@@ -78,7 +80,7 @@ def _host(url: str) -> str | None:
 def _is_shopee_host(host: str | None) -> bool:
     if not host:
         return False
-    return host in _SHOPEE_SHORT_HOSTS or bool(_SHOPEE_HOST_RE.match(host))
+    return bool(_SHOPEE_SHORT_HOST_RE.match(host)) or bool(_SHOPEE_HOST_RE.match(host))
 
 
 def _is_main_host(host: str | None) -> bool:
